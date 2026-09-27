@@ -9,6 +9,7 @@ use crate::commit_tooltip::{CommitAvatar, CommitTooltip};
 use crate::commit_view::CommitView;
 use crate::git_panel_settings::GitPanelScrollbarAccessor;
 use crate::project_diff::{DeployBranchDiff, Diff, ProjectDiff};
+use crate::pull_request_browser::PullRequestBrowser;
 use crate::remote_output::{self, RemoteAction, SuccessMessage};
 use crate::solo_diff_view::SoloDiffView;
 use crate::staged_diff::StagedDiff;
@@ -162,6 +163,8 @@ actions!(
         ActivateChangesTab,
         /// Activates the History tab.
         ActivateHistoryTab,
+        /// Activates the read-only GitHub Pull Requests tab.
+        ActivatePullRequestsTab,
     ]
 );
 
@@ -344,6 +347,11 @@ fn git_panel_context_menu(
             })
             .action_disabled_when(!has_stash_items, "Stash Pop", StashPop.boxed_clone())
             .action("View Stash", zed_actions::git::ViewStash.boxed_clone())
+            .separator()
+            .action(
+                "Compare HEAD with Upstream (No Fetch)",
+                crate::revision_diff::CompareHeadWithUpstream.boxed_clone(),
+            )
             .when(include_copy_paths, |context_menu| {
                 context_menu
                     .separator()
@@ -501,6 +509,13 @@ pub(crate) enum RemoteOperationKind {
 }
 
 pub fn register(workspace: &mut Workspace) {
+    workspace.register_action(|workspace, _: &ActivatePullRequestsTab, window, cx| {
+        if let Some(panel) = workspace.focus_panel::<GitPanel>(window, cx) {
+            panel.update(cx, |panel, cx| {
+                panel.activate_pull_requests_tab(&ActivatePullRequestsTab, window, cx)
+            });
+        }
+    });
     workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
         workspace.toggle_panel_focus::<GitPanel>(window, cx);
     });
@@ -560,6 +575,7 @@ struct SerializedCommitMessage {
 enum GitPanelTab {
     Changes,
     History,
+    PullRequests,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -1154,6 +1170,7 @@ pub struct GitPanel {
     bulk_staging: Option<BulkStaging>,
     stash_entries: GitStash,
     active_tab: GitPanelTab,
+    pull_request_browser: Option<Entity<PullRequestBrowser>>,
     commit_history_scroll_handle: UniformListScrollHandle,
     commit_history: CommitHistory,
     focused_history_entry: Option<usize>,
@@ -1468,6 +1485,7 @@ impl GitPanel {
                 bulk_staging: None,
                 stash_entries: Default::default(),
                 active_tab: GitPanelTab::Changes,
+                pull_request_browser: None,
                 commit_history_scroll_handle: UniformListScrollHandle::new(),
                 commit_history: CommitHistory::Loading,
                 focused_history_entry: None,
@@ -1876,6 +1894,7 @@ impl GitPanel {
             match self.active_tab {
                 GitPanelTab::Changes => dispatch_context.add("ChangesList"),
                 GitPanelTab::History => dispatch_context.add("HistoryList"),
+                GitPanelTab::PullRequests => dispatch_context.add("PullRequests"),
             }
         }
 
@@ -5102,6 +5121,9 @@ impl GitPanel {
             }
         }
         self.active_repository = new_active_repository;
+        if active_repository_changed {
+            self.reset_pull_request_browser(window, cx);
+        }
         self.reopen_commit_buffer(window, cx);
         self.preload_commit_history(cx);
         if self.active_tab == GitPanelTab::History {
@@ -5242,6 +5264,7 @@ impl GitPanel {
         let active_repository = self.project.read(cx).active_repository(cx);
         if active_repository != self.active_repository {
             self.active_repository = active_repository;
+            self.reset_pull_request_browser(window, cx);
             self.git_access = None;
             self.clear_marks();
         }
@@ -6948,11 +6971,24 @@ impl GitPanel {
             )
             .child(tab(
                 ElementId::Name("history-tab".into()),
-                active_tab != GitPanelTab::Changes,
+                active_tab == GitPanelTab::History,
                 false,
                 "History".into(),
                 GitPanelTab::History,
                 ActivateHistoryTab.boxed_clone(),
+            ))
+            .child(
+                Divider::vertical()
+                    .color(ui::DividerColor::BorderFaded)
+                    .h_full(),
+            )
+            .child(tab(
+                ElementId::Name("pull-requests-tab".into()),
+                active_tab == GitPanelTab::PullRequests,
+                false,
+                "Pull Requests".into(),
+                GitPanelTab::PullRequests,
+                ActivatePullRequestsTab.boxed_clone(),
             ))
     }
 
@@ -7096,21 +7132,62 @@ impl GitPanel {
         self.set_active_tab(GitPanelTab::History, window, cx);
     }
 
+    fn activate_pull_requests_tab(
+        &mut self,
+        _: &ActivatePullRequestsTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_active_tab(GitPanelTab::PullRequests, window, cx);
+    }
+
+    fn ensure_pull_request_browser(&mut self, cx: &mut Context<Self>) {
+        if self.pull_request_browser.is_none() {
+            self.pull_request_browser = Some(cx.new(|cx| {
+                PullRequestBrowser::new(
+                    self.project.clone(),
+                    self.active_repository.clone(),
+                    self.workspace.clone(),
+                    cx,
+                )
+            }));
+        }
+    }
+
+    fn reset_pull_request_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let was_focused = self
+            .pull_request_browser
+            .as_ref()
+            .is_some_and(|browser| browser.focus_handle(cx).contains_focused(window, cx));
+        self.pull_request_browser = None;
+        if self.active_tab == GitPanelTab::PullRequests {
+            self.ensure_pull_request_browser(cx);
+            if was_focused {
+                self.activation_focus_handle(cx).focus(window, cx);
+            }
+        }
+    }
+
     fn set_active_tab(&mut self, tab: GitPanelTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab == tab {
             return;
         }
         self.active_tab = tab;
-        self.activation_focus_handle(cx).focus(window, cx);
+        self.context_menu = None;
+        self.commit_editor_expanded = false;
         match tab {
             GitPanelTab::History => {
                 self.load_commit_history(cx);
             }
-            GitPanelTab::Changes => {
+            GitPanelTab::Changes | GitPanelTab::PullRequests => {
                 self.set_commit_history(CommitHistory::Loading, cx);
                 self._repo_subscriptions.clear();
+                if tab == GitPanelTab::PullRequests {
+                    self.ensure_pull_request_browser(cx);
+                }
             }
         }
+        self.activation_focus_handle(cx).focus(window, cx);
         cx.notify();
     }
 
@@ -8965,66 +9042,69 @@ impl Render for GitPanel {
             .id("git_panel")
             .key_context(self.dispatch_context(window, cx))
             .track_focus(&self.focus_handle)
-            .when(has_write_access && !project.is_read_only(cx), |this| {
-                this.on_action(cx.listener(Self::toggle_staged_for_selected))
-                    .on_action(cx.listener(Self::stage_range))
-                    .on_action(cx.listener(GitPanel::on_commit))
-                    .on_action(cx.listener(GitPanel::toggle_skip_hooks))
-                    .on_action(cx.listener(GitPanel::on_amend))
-                    .on_action(cx.listener(GitPanel::toggle_signoff_enabled))
-                    .on_action(cx.listener(Self::stage_all))
-                    .on_action(cx.listener(Self::unstage_all))
-                    .on_action(cx.listener(Self::stage_selected))
-                    .on_action(cx.listener(Self::unstage_selected))
-                    .on_action(cx.listener(Self::stage_section))
-                    .on_action(cx.listener(Self::unstage_section))
-                    .on_action(cx.listener(Self::restore_tracked_files))
-                    .on_action(cx.listener(Self::revert_selected))
-                    .on_action(cx.listener(Self::add_to_gitignore))
-                    .on_action(cx.listener(Self::add_to_git_info_exclude))
-                    .on_action(cx.listener(Self::clean_all))
-                    .on_action(cx.listener(Self::generate_commit_message_action))
-                    .on_action(cx.listener(Self::stash_all))
-                    .on_action(cx.listener(Self::stash_tracked))
-                    .on_action(cx.listener(Self::stash_staged))
-                    .on_action(cx.listener(Self::stash_pop))
+            .when(self.active_tab != GitPanelTab::PullRequests, |this| {
+                this.when(has_write_access && !project.is_read_only(cx), |this| {
+                    this.on_action(cx.listener(Self::toggle_staged_for_selected))
+                        .on_action(cx.listener(Self::stage_range))
+                        .on_action(cx.listener(GitPanel::on_commit))
+                        .on_action(cx.listener(GitPanel::toggle_skip_hooks))
+                        .on_action(cx.listener(GitPanel::on_amend))
+                        .on_action(cx.listener(GitPanel::toggle_signoff_enabled))
+                        .on_action(cx.listener(Self::stage_all))
+                        .on_action(cx.listener(Self::unstage_all))
+                        .on_action(cx.listener(Self::stage_selected))
+                        .on_action(cx.listener(Self::unstage_selected))
+                        .on_action(cx.listener(Self::stage_section))
+                        .on_action(cx.listener(Self::unstage_section))
+                        .on_action(cx.listener(Self::restore_tracked_files))
+                        .on_action(cx.listener(Self::revert_selected))
+                        .on_action(cx.listener(Self::add_to_gitignore))
+                        .on_action(cx.listener(Self::add_to_git_info_exclude))
+                        .on_action(cx.listener(Self::clean_all))
+                        .on_action(cx.listener(Self::generate_commit_message_action))
+                        .on_action(cx.listener(Self::stash_all))
+                        .on_action(cx.listener(Self::stash_tracked))
+                        .on_action(cx.listener(Self::stash_staged))
+                        .on_action(cx.listener(Self::stash_pop))
+                })
+                .on_action(cx.listener(Self::cancel))
+                .on_action(cx.listener(Self::collapse_selected_entry))
+                .on_action(cx.listener(Self::expand_selected_entry))
+                .on_action(cx.listener(Self::select_first))
+                .on_action(cx.listener(Self::select_next))
+                .on_action(cx.listener(Self::select_previous))
+                .on_action(cx.listener(Self::select_last))
+                .on_action(cx.listener(Self::first_entry))
+                .on_action(cx.listener(Self::next_entry))
+                .on_action(cx.listener(Self::previous_entry))
+                .on_action(cx.listener(Self::last_entry))
+                .on_action(cx.listener(Self::open_diff))
+                .on_action(cx.listener(Self::open_solo_diff))
+                .on_action(cx.listener(Self::view_file))
+                .on_action(cx.listener(Self::copy_path))
+                .on_action(cx.listener(Self::copy_relative_path))
+                .on_action(cx.listener(Self::view_unstaged_changes))
+                .on_action(cx.listener(Self::view_staged_changes))
+                .on_action(cx.listener(Self::focus_changes_list))
+                .on_action(cx.listener(Self::focus_editor))
+                .on_action(cx.listener(Self::expand_commit_editor))
+                .when(has_write_access && has_co_authors, |git_panel| {
+                    git_panel.on_action(cx.listener(Self::toggle_fill_co_authors))
+                })
+                .on_action(cx.listener(Self::set_sort_by_path))
+                .on_action(cx.listener(Self::set_sort_by_name))
+                .on_action(cx.listener(Self::set_group_by_none))
+                .on_action(cx.listener(Self::set_group_by_status))
+                .on_action(cx.listener(Self::set_group_by_staging))
+                .on_action(cx.listener(Self::toggle_tree_view))
+                .on_action(cx.listener(Self::increase_font_size))
+                .on_action(cx.listener(Self::decrease_font_size))
+                .on_action(cx.listener(Self::reset_font_size))
             })
-            .on_action(cx.listener(Self::cancel))
-            .on_action(cx.listener(Self::collapse_selected_entry))
-            .on_action(cx.listener(Self::expand_selected_entry))
-            .on_action(cx.listener(Self::select_first))
-            .on_action(cx.listener(Self::select_next))
-            .on_action(cx.listener(Self::select_previous))
-            .on_action(cx.listener(Self::select_last))
-            .on_action(cx.listener(Self::first_entry))
-            .on_action(cx.listener(Self::next_entry))
-            .on_action(cx.listener(Self::previous_entry))
-            .on_action(cx.listener(Self::last_entry))
             .on_action(cx.listener(Self::close_panel))
-            .on_action(cx.listener(Self::open_diff))
-            .on_action(cx.listener(Self::open_solo_diff))
-            .on_action(cx.listener(Self::view_file))
-            .on_action(cx.listener(Self::copy_path))
-            .on_action(cx.listener(Self::copy_relative_path))
-            .on_action(cx.listener(Self::view_unstaged_changes))
-            .on_action(cx.listener(Self::view_staged_changes))
-            .on_action(cx.listener(Self::focus_changes_list))
-            .on_action(cx.listener(Self::focus_editor))
-            .on_action(cx.listener(Self::expand_commit_editor))
-            .when(has_write_access && has_co_authors, |git_panel| {
-                git_panel.on_action(cx.listener(Self::toggle_fill_co_authors))
-            })
-            .on_action(cx.listener(Self::set_sort_by_path))
-            .on_action(cx.listener(Self::set_sort_by_name))
-            .on_action(cx.listener(Self::set_group_by_none))
-            .on_action(cx.listener(Self::set_group_by_status))
-            .on_action(cx.listener(Self::set_group_by_staging))
-            .on_action(cx.listener(Self::toggle_tree_view))
-            .on_action(cx.listener(Self::increase_font_size))
-            .on_action(cx.listener(Self::decrease_font_size))
-            .on_action(cx.listener(Self::reset_font_size))
             .on_action(cx.listener(Self::activate_changes_tab))
             .on_action(cx.listener(Self::activate_history_tab))
+            .on_action(cx.listener(Self::activate_pull_requests_tab))
             .size_full()
             .overflow_hidden()
             .bg(cx.theme().colors().panel_background)
@@ -9061,6 +9141,9 @@ impl Render for GitPanel {
                                 this.children(self.render_previous_commit(window, cx))
                             }),
                         GitPanelTab::History => this.child(self.render_history_tab(window, cx)),
+                        GitPanelTab::PullRequests => {
+                            this.children(self.pull_request_browser.clone())
+                        }
                     })
                     .into_any_element(),
             )
@@ -9113,6 +9196,13 @@ impl editor::Addon for GitPanelAddon {
 
 impl Panel for GitPanel {
     fn activation_focus_handle(&self, cx: &App) -> FocusHandle {
+        if self.active_tab == GitPanelTab::PullRequests {
+            return self
+                .pull_request_browser
+                .as_ref()
+                .map(|browser| browser.focus_handle(cx))
+                .unwrap_or_else(|| self.focus_handle.clone());
+        }
         if self.active_tab == GitPanelTab::Changes
             && (self.entries.is_empty() || self.commit_editor_expanded)
         {
@@ -13585,6 +13675,11 @@ mod tests {
                 !context.contains("ChangesList"),
                 "should not have ChangesList context when history list is focused"
             );
+            panel.active_tab = GitPanelTab::PullRequests;
+            let context = panel.dispatch_context(window, cx);
+            assert!(context.contains("PullRequests"));
+            assert!(!context.contains("ChangesList"));
+            assert!(!context.contains("HistoryList"));
             panel.active_tab = GitPanelTab::Changes;
         });
 
@@ -13668,7 +13763,31 @@ mod tests {
             assert!(context.contains("ChangesList"));
             assert!(context.contains("menu"));
             assert!(!context.contains("CommitEditor"));
-        })
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.activate_pull_requests_tab(&ActivatePullRequestsTab, window, cx);
+            assert_eq!(panel.active_tab, GitPanelTab::PullRequests);
+            assert!(panel.context_menu.is_none());
+            assert!(panel.activation_focus_handle(cx).is_focused(window));
+            let previous_browser = panel
+                .pull_request_browser
+                .as_ref()
+                .expect("PR browser")
+                .entity_id();
+            panel.reset_pull_request_browser(window, cx);
+            assert_ne!(
+                panel
+                    .pull_request_browser
+                    .as_ref()
+                    .expect("new PR browser")
+                    .entity_id(),
+                previous_browser
+            );
+            assert!(panel.activation_focus_handle(cx).is_focused(window));
+            panel.activate_changes_tab(&ActivateChangesTab, window, cx);
+            assert_eq!(panel.active_tab, GitPanelTab::Changes);
+        });
     }
 
     #[gpui::test]

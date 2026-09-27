@@ -41,8 +41,8 @@ use git::{
         CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions, FileHistoryChangedFileSets,
         GitCommitTemplate, GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData,
         LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput, RepoPath, ResetMode,
-        SearchCommitArgs, UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag,
-        is_binary_content,
+        RevisionDiffMode, SearchCommitArgs, UpstreamTrackingStatus, Worktree as GitWorktree,
+        delete_branch_flag, is_binary_content,
     },
     stash::{GitStash, StashEntry},
     status::{
@@ -223,6 +223,16 @@ fn decode_git_text(bytes: Vec<u8>) -> Result<String> {
 pub struct CommitDiff {
     pub files: Vec<CommitFile>,
     pub is_shallow_boundary: bool,
+}
+
+/// An immutable comparison, decoded for native diff editors.
+#[derive(Debug)]
+pub struct RevisionDiff {
+    /// The effective old-side commit (the merge base in merge-base mode).
+    pub base: Oid,
+    pub head: Oid,
+    /// Binary files retain side presence but have empty text, matching commit diffs.
+    pub files: Vec<CommitFile>,
 }
 
 #[derive(Debug)]
@@ -7229,6 +7239,36 @@ impl Repository {
                             .collect::<Result<Vec<_>>>()?,
                         is_shallow_boundary: response.is_shallow_boundary,
                     })
+                }
+            }
+        })
+    }
+
+    /// Compare pinned revisions without changing the worktree, index, or refs.
+    /// Only local repositories are supported. Renames appear as deletion/addition pairs.
+    pub fn load_revision_diff(
+        &mut self,
+        base: Oid,
+        head: Oid,
+        mode: RevisionDiffMode,
+    ) -> oneshot::Receiver<Result<RevisionDiff>> {
+        self.send_job("load_revision_diff", None, move |git_repo, cx| async move {
+            match git_repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    let diff = backend.load_revision_diff(base, head, mode, cx).await?;
+                    let files = decode_commit_diff(git::repository::CommitDiff {
+                        files: diff.files,
+                        is_shallow_boundary: false,
+                    })
+                    .files;
+                    Ok(RevisionDiff {
+                        base: diff.base,
+                        head: diff.head,
+                        files,
+                    })
+                }
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("revision diffs are only supported locally")
                 }
             }
         })

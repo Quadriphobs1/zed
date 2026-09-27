@@ -533,6 +533,25 @@ pub struct CommitDiff {
     pub is_shallow_boundary: bool,
 }
 
+/// Chooses the old side of an immutable revision comparison.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RevisionDiffMode {
+    /// Compare the supplied base commit's tree directly with the head commit's tree.
+    Direct,
+    /// Compare the unique merge base of the supplied commits with the head commit.
+    /// Shallow repositories and missing or multiple merge bases produce an error.
+    MergeBase,
+}
+
+#[derive(Debug)]
+pub struct RevisionDiff {
+    /// The effective old-side commit, which may be a merge base rather than the input base.
+    pub base: Oid,
+    pub head: Oid,
+    /// Complete object contents. Renames are represented as a deletion and an addition.
+    pub files: Vec<CommitFile>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FileHistoryChangedFileSets {
     pub file_sets: Vec<Vec<RepoPath>>,
@@ -621,6 +640,70 @@ async fn load_commit_object<R: smol::io::AsyncBufRead + Unpin>(
         Some(_) => Ok(Some(read_commit_blob(stdout, info_line, newline).await?)),
         None => Ok(None),
     }
+}
+
+async fn load_diff_files(git: &GitBinary, raw_diff: &str) -> Result<Vec<CommitFile>> {
+    let changes = parse_git_diff_raw(raw_diff);
+    let mut cat_file_process = git
+        .build_command(&["cat-file", "--batch=%(objectsize)"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("starting git cat-file process")?;
+
+    let mut files = Vec::<CommitFile>::new();
+    let stdin = cat_file_process
+        .stdin
+        .take()
+        .context("git cat-file process has no stdin")?;
+    let stdout = cat_file_process
+        .stdout
+        .take()
+        .context("git cat-file process has no stdout")?;
+    let mut stdin = BufWriter::with_capacity(512, stdin);
+    let mut stdout = BufReader::new(stdout);
+    let mut info_line = String::new();
+    let mut newline = [b'\0'];
+    for change in changes {
+        let change = change?;
+        let path = change.path;
+        // git-show outputs `/`-delimited paths even on Windows.
+        let Some(rel_path) = RelPath::from_unix_str(path).log_err() else {
+            continue;
+        };
+
+        let objects = [change.new_object, change.old_object];
+        let mut has_blobs = false;
+        for object in objects.iter().flatten() {
+            if object.kind == CommitDiffObjectKind::Blob {
+                stdin.write_all(object.oid.as_bytes()).await?;
+                stdin.write_all(b"\n").await?;
+                has_blobs = true;
+            }
+        }
+        if has_blobs {
+            stdin.flush().await?;
+        }
+
+        let [new_object, old_object] = objects;
+        let new_object =
+            load_commit_object(new_object, &mut stdout, &mut info_line, &mut newline).await?;
+        let old_object =
+            load_commit_object(old_object, &mut stdout, &mut info_line, &mut newline).await?;
+        let is_binary = new_object.as_ref().is_some_and(|object| object.is_binary)
+            || old_object.as_ref().is_some_and(|object| object.is_binary);
+        let new_content = new_object.map(|object| object.content);
+        let old_content = old_object.map(|object| object.content);
+
+        files.push(CommitFile {
+            path: RepoPath(Arc::from(rel_path)),
+            old_content,
+            new_content,
+            is_binary,
+        })
+    }
+    Ok(files)
 }
 
 async fn read_shallow_file(shallow_file_path: &Path) -> Result<Option<String>> {
@@ -924,6 +1007,18 @@ pub trait GitRepository: Send + Sync {
         ignore_shallow_boundary: bool,
         cx: AsyncApp,
     ) -> BoxFuture<'_, Result<CommitDiff>>;
+    /// Load a read-only comparison of pinned commits, without consulting the index or worktree.
+    /// Missing objects are errors; this never fetches or changes refs.
+    fn load_revision_diff(
+        &self,
+        _base: Oid,
+        _head: Oid,
+        _mode: RevisionDiffMode,
+        _cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<RevisionDiff>> {
+        async { bail!("revision diffs are not supported by this repository backend") }.boxed()
+    }
+
     fn blame(
         &self,
         path: RepoPath,
@@ -1488,74 +1583,89 @@ impl GitRepository for RealGitRepository {
             );
 
             let show_stdout = String::from_utf8_lossy(&show_output.stdout);
-            let changes = parse_git_diff_raw(&show_stdout);
-
-            let mut cat_file_process = git
-                .build_command(&["cat-file", "--batch=%(objectsize)"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .context("starting git cat-file process")?;
-
-            let mut files = Vec::<CommitFile>::new();
-            let stdin = cat_file_process
-                .stdin
-                .take()
-                .context("git cat-file process has no stdin")?;
-            let stdout = cat_file_process
-                .stdout
-                .take()
-                .context("git cat-file process has no stdout")?;
-            let mut stdin = BufWriter::with_capacity(512, stdin);
-            let mut stdout = BufReader::new(stdout);
-            let mut info_line = String::new();
-            let mut newline = [b'\0'];
-            for change in changes {
-                let change = change?;
-                let path = change.path;
-                // git-show outputs `/`-delimited paths even on Windows.
-                let Some(rel_path) = RelPath::from_unix_str(path).log_err() else {
-                    continue;
-                };
-
-                let objects = [change.new_object, change.old_object];
-                let mut has_blobs = false;
-                for object in objects.iter().flatten() {
-                    if object.kind == CommitDiffObjectKind::Blob {
-                        stdin.write_all(object.oid.as_bytes()).await?;
-                        stdin.write_all(b"\n").await?;
-                        has_blobs = true;
-                    }
-                }
-                if has_blobs {
-                    stdin.flush().await?;
-                }
-
-                let [new_object, old_object] = objects;
-                let new_object =
-                    load_commit_object(new_object, &mut stdout, &mut info_line, &mut newline)
-                        .await?;
-                let old_object =
-                    load_commit_object(old_object, &mut stdout, &mut info_line, &mut newline)
-                        .await?;
-                let is_binary = new_object.as_ref().is_some_and(|object| object.is_binary)
-                    || old_object.as_ref().is_some_and(|object| object.is_binary);
-                let new_content = new_object.map(|object| object.content);
-                let old_content = old_object.map(|object| object.content);
-
-                files.push(CommitFile {
-                    path: RepoPath(Arc::from(rel_path)),
-                    old_content,
-                    new_content,
-                    is_binary,
-                })
-            }
+            let files = load_diff_files(&git, &show_stdout).await?;
 
             Ok(CommitDiff {
                 files,
                 is_shallow_boundary: false,
             })
+        })
+        .boxed()
+    }
+
+    fn load_revision_diff(
+        &self,
+        base: Oid,
+        head: Oid,
+        mode: RevisionDiffMode,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<RevisionDiff>> {
+        let git = self.git_binary().envs(HashMap::from_iter([
+            ("GIT_NO_LAZY_FETCH".into(), "1".into()),
+            ("GIT_NO_REPLACE_OBJECTS".into(), "1".into()),
+        ]));
+        cx.background_spawn(async move {
+            let resolve_commit = async |revision: Oid| -> Result<Oid> {
+                let output = git
+                    .run(&[
+                        "rev-parse",
+                        "--verify",
+                        "--end-of-options",
+                        &format!("{revision}^{{commit}}"),
+                    ])
+                    .await
+                    .with_context(|| format!("resolving revision {revision}"))?;
+                Oid::from_str(output.trim())
+            };
+            let mut base = resolve_commit(base).await?;
+            let head = resolve_commit(head).await?;
+            if mode == RevisionDiffMode::MergeBase {
+                let is_shallow = git
+                    .run(&["rev-parse", "--is-shallow-repository"])
+                    .await
+                    .context("checking revision diff history completeness")?;
+                anyhow::ensure!(
+                    is_shallow == "false",
+                    "merge-base revision diffs require complete history; fetch full history before retrying"
+                );
+                let output = git
+                    .run(&["merge-base", "--all", &base.to_string(), &head.to_string()])
+                    .await
+                    .context("finding revision diff merge base; history may be incomplete")?;
+                let mut merge_bases = output.lines();
+                base = Oid::from_str(merge_bases.next().context("no merge base found")?)?;
+                anyhow::ensure!(
+                    merge_bases.next().is_none(),
+                    "revision diff requires a unique merge base"
+                );
+            }
+            let output = git
+                .build_command(&[
+                    "diff",
+                    "--raw",
+                    "-z",
+                    "--no-renames",
+                    "--no-abbrev",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-relative",
+                    "--ignore-submodules=none",
+                    &base.to_string(),
+                    &head.to_string(),
+                    "--",
+                ])
+                .output()
+                .await
+                .context("starting git revision diff")?;
+            anyhow::ensure!(
+                output.status.success(),
+                "git revision diff failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let raw_diff = std::str::from_utf8(&output.stdout)
+                .context("revision diff contains a non-UTF-8 path")?;
+            let files = load_diff_files(&git, raw_diff).await?;
+            Ok(RevisionDiff { base, head, files })
         })
         .boxed()
     }
@@ -4630,6 +4740,267 @@ mod tests {
                     TreeDiffStatus::Modified { old: base_oid },
                 )]),
             }
+        );
+    }
+
+    #[gpui::test]
+    async fn test_load_revision_diff_pinned_revisions(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().expect("temporary repository");
+        let path = directory.path();
+        git_init_repo(path);
+        fs::write(path.join("file.txt"), "initial\n").expect("write initial file");
+        fs::write(path.join("old.txt"), "renamed contents\n").expect("write renamed file");
+        git_command(path, ["add", "."]);
+        git_command(path, ["commit", "-m", "initial"]);
+        let ancestor =
+            Oid::from_str(&git_command_output(path, ["rev-parse", "HEAD"])).expect("ancestor oid");
+        git_command(path, ["switch", "-c", "feature"]);
+        fs::write(path.join("file.txt"), "intermediate\n").expect("write intermediate file");
+        git_command(path, ["commit", "-am", "first feature commit"]);
+        fs::write(path.join("file.txt"), "final\n").expect("write final file");
+        git_command(path, ["mv", "old.txt", "new.txt"]);
+        fs::write(path.join("binary.dat"), b"binary\0contents").expect("write binary");
+        git_command(path, ["add", "."]);
+        git_command(path, ["commit", "-m", "second feature commit"]);
+        let head =
+            Oid::from_str(&git_command_output(path, ["rev-parse", "HEAD"])).expect("head oid");
+        git_command(path, ["switch", "main"]);
+        fs::write(path.join("base-only.txt"), "base only\n").expect("write base-only file");
+        git_command(path, ["add", "."]);
+        git_command(path, ["commit", "-m", "divergent base"]);
+        let base =
+            Oid::from_str(&git_command_output(path, ["rev-parse", "HEAD"])).expect("base oid");
+        fs::write(path.join("file.txt"), "staged\n").expect("write staged file");
+        git_command(path, ["add", "file.txt"]);
+        fs::write(path.join("file.txt"), "unstaged\n").expect("write unstaged file");
+        fs::write(path.join("untracked.txt"), "untracked\n").expect("write untracked file");
+        let status_before = git_command_output(path, ["status", "--porcelain"]);
+        let index_before = fs::read(path.join(".git/index")).expect("read index");
+        let head_before = fs::read(path.join(".git/HEAD")).expect("read HEAD");
+        let repository =
+            RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                .expect("open repository");
+
+        let diff = repository
+            .load_revision_diff(base, head, RevisionDiffMode::MergeBase, cx.to_async())
+            .await
+            .expect("load PR diff");
+        assert_eq!(diff.base, ancestor);
+        assert_eq!(diff.head, head);
+        assert_eq!(diff.files.len(), 4);
+        let file = diff
+            .files
+            .iter()
+            .find(|file| file.path.as_unix_str() == "file.txt")
+            .expect("modified file");
+        assert_eq!(file.old_content.as_deref(), Some(b"initial\n".as_slice()));
+        assert_eq!(file.new_content.as_deref(), Some(b"final\n".as_slice()));
+        let binary = diff
+            .files
+            .iter()
+            .find(|file| file.path.as_unix_str() == "binary.dat")
+            .expect("binary file");
+        assert!(binary.is_binary);
+        assert_eq!(
+            binary.new_content.as_deref(),
+            Some(b"binary\0contents".as_slice())
+        );
+        let deleted = diff
+            .files
+            .iter()
+            .find(|file| file.path.as_unix_str() == "old.txt")
+            .expect("deleted rename source");
+        assert_eq!(deleted.status(), CommitFileStatus::Deleted);
+        let added = diff
+            .files
+            .iter()
+            .find(|file| file.path.as_unix_str() == "new.txt")
+            .expect("added rename destination");
+        assert_eq!(added.status(), CommitFileStatus::Added);
+        assert_eq!(deleted.old_content, added.new_content);
+
+        let direct = repository
+            .load_revision_diff(base, head, RevisionDiffMode::Direct, cx.to_async())
+            .await
+            .expect("load tip-to-tip diff");
+        assert_eq!(direct.base, base);
+        assert_eq!(direct.files.len(), 5);
+        assert!(
+            direct
+                .files
+                .iter()
+                .any(|file| file.path.as_unix_str() == "base-only.txt"
+                    && file.status() == CommitFileStatus::Deleted)
+        );
+        assert!(
+            repository
+                .load_revision_diff(head, head, RevisionDiffMode::Direct, cx.to_async())
+                .await
+                .expect("load identical revisions")
+                .files
+                .is_empty()
+        );
+        let missing =
+            Oid::from_str("1111111111111111111111111111111111111111").expect("missing oid");
+        assert!(
+            repository
+                .load_revision_diff(missing, head, RevisionDiffMode::Direct, cx.to_async())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(path.join(".git/index")).expect("read index"),
+            index_before
+        );
+        assert_eq!(
+            fs::read(path.join(".git/HEAD")).expect("read HEAD"),
+            head_before
+        );
+        assert_eq!(
+            git_command_output(path, ["rev-parse", "HEAD"]),
+            base.to_string()
+        );
+        assert_eq!(
+            git_command_output(path, ["status", "--porcelain"]),
+            status_before
+        );
+        assert_eq!(
+            fs::read_to_string(path.join("file.txt")).expect("read worktree"),
+            "unstaged\n"
+        );
+        assert_eq!(
+            fs::read_to_string(path.join("untracked.txt")).expect("read untracked"),
+            "untracked\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_load_revision_diff_requires_commits_and_unique_merge_base(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().expect("temporary repository");
+        let path = directory.path();
+        git_init_repo(path);
+        fs::write(path.join("file.txt"), "initial\n").expect("write initial file");
+        git_command(path, ["add", "."]);
+        git_command(path, ["commit", "-m", "initial"]);
+        let ancestor = git_command_output(path, ["rev-parse", "HEAD"]);
+        let tree = git_command_output(path, ["rev-parse", "HEAD^{tree}"]);
+        let left = git_command_output(path, ["commit-tree", &tree, "-p", &ancestor, "-m", "left"]);
+        let right =
+            git_command_output(path, ["commit-tree", &tree, "-p", &ancestor, "-m", "right"]);
+        let first_merge = git_command_output(
+            path,
+            [
+                "commit-tree",
+                &tree,
+                "-p",
+                &left,
+                "-p",
+                &right,
+                "-m",
+                "first merge",
+            ],
+        );
+        let second_merge = git_command_output(
+            path,
+            [
+                "commit-tree",
+                &tree,
+                "-p",
+                &right,
+                "-p",
+                &left,
+                "-m",
+                "second merge",
+            ],
+        );
+        let unrelated = git_command_output(path, ["commit-tree", &tree, "-m", "unrelated root"]);
+        let repository =
+            RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                .expect("open repository");
+        let first_merge = Oid::from_str(&first_merge).expect("first merge oid");
+        let second_merge = Oid::from_str(&second_merge).expect("second merge oid");
+        let error = repository
+            .load_revision_diff(
+                first_merge,
+                second_merge,
+                RevisionDiffMode::MergeBase,
+                cx.to_async(),
+            )
+            .await
+            .expect_err("ambiguous merge base must fail");
+        assert!(error.to_string().contains("unique merge base"));
+        assert!(
+            repository
+                .load_revision_diff(
+                    first_merge,
+                    second_merge,
+                    RevisionDiffMode::Direct,
+                    cx.to_async()
+                )
+                .await
+                .expect("direct comparison does not need ancestry")
+                .files
+                .is_empty()
+        );
+        let ancestor = Oid::from_str(&ancestor).expect("ancestor oid");
+        let unrelated = Oid::from_str(&unrelated).expect("unrelated oid");
+        assert!(
+            repository
+                .load_revision_diff(
+                    ancestor,
+                    unrelated,
+                    RevisionDiffMode::MergeBase,
+                    cx.to_async()
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            repository
+                .load_revision_diff(ancestor, unrelated, RevisionDiffMode::Direct, cx.to_async())
+                .await
+                .expect("compare unrelated trees directly")
+                .files
+                .is_empty()
+        );
+        let tree = Oid::from_str(&tree).expect("tree oid");
+        assert!(
+            repository
+                .load_revision_diff(tree, ancestor, RevisionDiffMode::Direct, cx.to_async())
+                .await
+                .is_err()
+        );
+
+        fs::write(path.join(".git/shallow"), format!("{ancestor}\n"))
+            .expect("mark ancestor as a shallow boundary");
+        let error = repository
+            .load_revision_diff(
+                ancestor,
+                first_merge,
+                RevisionDiffMode::MergeBase,
+                cx.to_async(),
+            )
+            .await
+            .expect_err("shallow merge-base comparison must fail");
+        assert!(error.to_string().contains("require complete history"));
+        assert!(
+            repository
+                .load_revision_diff(
+                    ancestor,
+                    first_merge,
+                    RevisionDiffMode::Direct,
+                    cx.to_async()
+                )
+                .await
+                .expect("direct comparison can read shallow trees")
+                .files
+                .is_empty()
         );
     }
 
