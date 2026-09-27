@@ -102,6 +102,11 @@ pub trait GitHostingProvider {
         None
     }
 
+    /// Whether this provider exposes GitHub's pull request API, including Enterprise instances.
+    fn supports_github_pull_requests(&self) -> bool {
+        false
+    }
+
     /// Returns whether this provider supports avatars.
     fn supports_avatars(&self) -> bool;
 

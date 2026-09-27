@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result, ensure};
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, ScrollHandle, Task, WeakEntity,
-    Window,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, ScrollStrategy, Task,
+    UniformListScrollHandle, WeakEntity, Window, uniform_list,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use project::{Project, git_store::Repository, trusted_worktrees::TrustedWorktrees};
@@ -58,7 +58,7 @@ pub(super) struct PullRequestBrowser {
     filter: PullRequestFilter,
     state: ListState,
     selected_entry: Option<usize>,
-    scroll_handle: ScrollHandle,
+    scroll_handle: UniformListScrollHandle,
     task: Task<()>,
 }
 
@@ -79,7 +79,7 @@ impl PullRequestBrowser {
             filter: PullRequestFilter::All,
             state: ListState::default(),
             selected_entry: None,
-            scroll_handle: ScrollHandle::new(),
+            scroll_handle: UniformListScrollHandle::new(),
             task: Task::ready(()),
         };
         this.load_remotes(cx);
@@ -112,12 +112,13 @@ impl PullRequestBrowser {
                 match result {
                     Ok(remotes) => {
                         this.remotes = remotes.into_iter().filter_map(|(name, url)| {
-                            Some((name, GitHubRepository::from_remote_url(&url)?))
+                            let registry = git::GitHostingProviderRegistry::default_global(cx);
+                            Some((name, GitHubRepository::from_remote_url(registry, &url)?))
                         }).collect();
                         this.remotes.sort_by(|left, right| left.0.cmp(&right.0));
                         this.state.complete(generation, Ok(Vec::new()));
                         if this.remotes.is_empty() {
-                            this.state.error = Some("No supported github.com remotes. GitHub Enterprise and other hosts are not supported.".into());
+                            this.state.error = Some("No recognized GitHub remotes. For Enterprise, configure this host as GitHub in git_hosting_providers, then reload remotes. Other providers are not supported.".into());
                         }
                     }
                     Err(error) => this.state.complete(generation, Err(error)),
@@ -131,7 +132,7 @@ impl PullRequestBrowser {
     fn refresh(&mut self, cx: &mut Context<Self>) {
         self.task = Task::ready(());
         self.selected_entry = None;
-        self.scroll_handle.set_offset(gpui::point(px(0.), px(0.)));
+        self.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
         let generation = self.state.begin();
         let target = self
             .selected_remote
@@ -192,7 +193,8 @@ impl PullRequestBrowser {
             (None, _) => 0,
         };
         self.selected_entry = Some(index);
-        self.scroll_handle.scroll_to_item(index);
+        self.scroll_handle
+            .scroll_to_item(index, ScrollStrategy::Top);
         cx.notify();
     }
 }
@@ -233,8 +235,7 @@ impl Render for PullRequestBrowser {
         v_flex()
             .size_full()
             .min_h_0()
-            .gap_2()
-            .p_2()
+            .overflow_hidden()
             .track_focus(&self.focus_handle)
             .key_context("PullRequests menu")
             .on_action(cx.listener(|this, _: &menu::SelectNext, _, cx| {
@@ -248,108 +249,158 @@ impl Render for PullRequestBrowser {
                     this.open_entry(index, window, cx);
                 }
             }))
-            .child(Label::new("GitHub remote (choose explicitly)").size(LabelSize::Small))
-            .children(
-                self.remotes
-                    .iter()
-                    .enumerate()
-                    .map(|(index, (name, target))| {
-                        Button::new(("pr-remote", index), format!("{name} → {}", target.slug()))
-                            .toggle_state(self.selected_remote == Some(index))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.selected_remote = Some(index);
-                                this.refresh(cx);
-                            }))
-                    }),
-            )
             .child(
-                h_flex().flex_wrap().gap_1().children(
-                    PullRequestFilter::ALL
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, filter)| {
-                            Button::new(("pr-filter", index), filter.label())
-                                .label_size(LabelSize::Small)
-                                .toggle_state(self.filter == filter)
-                                .disabled(self.selected_remote.is_none())
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.filter = filter;
-                                    this.refresh(cx);
-                                }))
-                        }),
-                ),
-            )
-            .child(
-                h_flex()
-                    .gap_1()
-                    .child(
-                        Button::new("pr-refresh", "Refresh")
-                            .disabled(self.selected_remote.is_none())
-                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                v_flex()
+                    .gap_2()
+                    .p_2()
+                    .child(Label::new("GitHub remote (choose explicitly)").size(LabelSize::Small))
+                    .children(
+                        self.remotes
+                            .iter()
+                            .enumerate()
+                            .map(|(index, (name, target))| {
+                                Button::new(
+                                    ("pr-remote", index),
+                                    format!("{name} → {}", target.target()),
+                                )
+                                .toggle_state(self.selected_remote == Some(index))
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.selected_remote = Some(index);
+                                        this.refresh(cx);
+                                    },
+                                ))
+                            }),
                     )
                     .child(
-                        Button::new("pr-remotes", "Reload remotes")
-                            .on_click(cx.listener(|this, _, _, cx| this.load_remotes(cx))),
+                        h_flex().flex_wrap().gap_1().children(
+                            PullRequestFilter::ALL.into_iter().enumerate().map(
+                                |(index, filter)| {
+                                    Button::new(("pr-filter", index), filter.label())
+                                        .label_size(LabelSize::Small)
+                                        .toggle_state(self.filter == filter)
+                                        .disabled(self.selected_remote.is_none())
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.filter = filter;
+                                            this.refresh(cx);
+                                        }))
+                                },
+                            ),
+                        ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new("pr-refresh", "Refresh")
+                                    .disabled(self.selected_remote.is_none())
+                                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                            )
+                            .child(
+                                Button::new("pr-remotes", "Reload remotes")
+                                    .on_click(cx.listener(|this, _, _, cx| this.load_remotes(cx))),
+                            ),
+                    )
+                    .child(
+                        Label::new(format!(
+                            "Open PRs • Up to {RESULT_LIMIT} results; not a complete list"
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    )
+                    .when(self.state.loading, |this| {
+                        this.child(Label::new("Loading…"))
+                    })
+                    .when_some(self.state.error.clone(), |this, error| {
+                        this.child(Label::new(error).color(Color::Error))
+                    })
+                    .when(
+                        !self.state.loading
+                            && self.state.error.is_none()
+                            && self.selected_remote.is_none(),
+                        |this| {
+                            this.child(Label::new("Select a remote above to load pull requests."))
+                        },
+                    )
+                    .when(
+                        !self.state.loading
+                            && self.state.error.is_none()
+                            && self.selected_remote.is_some()
+                            && self.state.entries.is_empty(),
+                        |this| this.child(Label::new("No open pull requests match this filter.")),
                     ),
             )
             .child(
-                Label::new(format!(
-                    "Open PRs • Up to {RESULT_LIMIT} results; not a complete list"
-                ))
-                .size(LabelSize::Small)
-                .color(Color::Muted),
-            )
-            .when(self.state.loading, |this| {
-                this.child(Label::new("Loading…"))
-            })
-            .when_some(self.state.error.clone(), |this, error| {
-                this.child(Label::new(error).color(Color::Error))
-            })
-            .when(
-                !self.state.loading && self.state.error.is_none() && self.selected_remote.is_none(),
-                |this| this.child(Label::new("Select a remote above to load pull requests.")),
-            )
-            .when(
-                !self.state.loading
-                    && self.state.error.is_none()
-                    && self.selected_remote.is_some()
-                    && self.state.entries.is_empty(),
-                |this| this.child(Label::new("No open pull requests match this filter.")),
-            )
-            .child(
-                v_flex()
-                    .id("pr-list")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll_handle)
-                    .children(self.state.entries.iter().enumerate().map(|(index, entry)| {
-                        v_flex()
-                            .py_1()
-                            .child(
-                                Button::new(
-                                    ("pr-entry", index),
-                                    format!("#{} {}", entry.number, entry.title),
+                uniform_list(
+                    "pr-list",
+                    self.state.entries.len(),
+                    cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+                        range
+                            .filter_map(|index| {
+                                let entry = this.state.entries.get(index)?;
+                                Some(
+                                    v_flex()
+                                        .id(("pr-entry", index))
+                                        .debug_selector(move || format!("pr-row-{index}"))
+                                        .cursor_pointer()
+                                        .w_full()
+                                        .min_w_0()
+                                        .py_1()
+                                        .px_2()
+                                        .gap_0p5()
+                                        .border_1()
+                                        .border_color(gpui::transparent_black())
+                                        .hover(|style| style.bg(cx.theme().colors().element_hover))
+                                        .when(this.selected_entry == Some(index), |row| {
+                                            row.border_color(
+                                                cx.theme().colors().panel_focused_border,
+                                            )
+                                        })
+                                        .child(
+                                            h_flex()
+                                                .w_full()
+                                                .min_w_0()
+                                                .child(Label::new(entry.title.clone()).truncate()),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .w_full()
+                                                .min_w_0()
+                                                .gap_1p5()
+                                                .child(
+                                                    Label::new(entry.author_login().to_owned())
+                                                        .size(LabelSize::Small)
+                                                        .color(Color::Muted)
+                                                        .truncate(),
+                                                )
+                                                .child(
+                                                    Label::new(format!(
+                                                        "• #{}{}",
+                                                        entry.number,
+                                                        if entry.is_draft {
+                                                            " • Draft"
+                                                        } else {
+                                                            ""
+                                                        }
+                                                    ))
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted)
+                                                    .flex_none(),
+                                                ),
+                                        )
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.selected_entry = Some(index);
+                                            this.open_entry(index, window, cx);
+                                            cx.notify();
+                                        })),
                                 )
-                                .full_width()
-                                .toggle_state(self.selected_entry == Some(index))
-                                .on_click(cx.listener(
-                                    move |this, _, window, cx| {
-                                        this.selected_entry = Some(index);
-                                        this.open_entry(index, window, cx);
-                                    },
-                                )),
-                            )
-                            .child(
-                                Label::new(format!(
-                                    "{}{}",
-                                    entry.author_login(),
-                                    if entry.is_draft { " • Draft" } else { "" }
-                                ))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                            )
-                    })),
+                            })
+                            .collect()
+                    }),
+                )
+                .flex_1()
+                .size_full()
+                .track_scroll(&self.scroll_handle),
             )
     }
 }
@@ -468,6 +519,55 @@ impl Render for PullRequestDescription {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    async fn test_pr_row_click_target(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            language_model::init(cx);
+            editor::init(cx);
+            crate::init(cx);
+        });
+        let fs = project::FakeFs::new(cx.background_executor.clone());
+        let project = Project::test(fs, [], cx).await;
+        let workspace_window = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = workspace_window
+            .read_with(cx, |root, _| root.workspace().clone())
+            .expect("workspace");
+        let window = cx.add_window(|_, cx| {
+            let mut browser = PullRequestBrowser::new(project, None, workspace.downgrade(), cx);
+            browser.state.error = None;
+            browser.state.entries = serde_json::from_value(serde_json::json!([
+                {"number": 1, "title": "A long pull request title that must truncate rather than clip its beginning".repeat(5), "author": {"login": "author"}, "isDraft": false},
+                {"number": 2, "title": "Short title", "author": {"login": "author"}, "isDraft": true}
+            ])).expect("PR fixture");
+            browser
+        });
+        let browser = window.root(cx).expect("browser");
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(px(320.), px(600.)));
+        cx.refresh().expect("render rows");
+        cx.run_until_parked();
+        let row = cx.debug_bounds("pr-row-0").expect("rendered row");
+        let next_row = cx.debug_bounds("pr-row-1").expect("second row");
+        assert_eq!(row.size, next_row.size, "long titles must not grow rows");
+        assert_eq!(row.left(), next_row.left());
+        assert!(row.right() <= px(320.));
+        assert_eq!(row.bottom(), next_row.top());
+
+        // The metadata line must open the row too, just like History.
+        cx.simulate_click(
+            gpui::point(row.left() + px(20.), row.bottom() - px(10.)),
+            gpui::Modifiers::default(),
+        );
+        browser.read_with(&cx, |browser, _| {
+            assert_eq!(browser.selected_entry, Some(0))
+        });
+    }
 
     #[test]
     fn test_pull_request_browser_stale_results_and_errors() {

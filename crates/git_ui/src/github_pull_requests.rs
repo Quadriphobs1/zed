@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result, ensure};
-use git::Oid;
+use git::{GitHostingProviderRegistry, Oid, RemoteUrl, parse_git_remote_url};
 use serde::Deserialize;
-use std::str::FromStr as _;
+use std::{str::FromStr as _, sync::Arc};
 use util::command::{Stdio, new_command};
 
 pub(super) const RESULT_LIMIT: usize = 100;
@@ -11,19 +11,40 @@ const DETAIL_FIELDS: &str =
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct GitHubRepository {
+    host: String,
     owner: String,
     name: String,
 }
 
 impl GitHubRepository {
-    pub(super) fn from_remote_url(url: &str) -> Option<Self> {
-        let path = url
-            .strip_prefix("https://github.com/")
-            .or_else(|| url.strip_prefix("git@github.com:"))
-            .or_else(|| url.strip_prefix("ssh://git@github.com/"))?;
-        let path = path.strip_suffix('/').unwrap_or(path);
-        let path = path.strip_suffix(".git").unwrap_or(path);
-        let (owner, name) = path.split_once('/')?;
+    pub(super) fn from_remote_url(
+        registry: Arc<GitHostingProviderRegistry>,
+        url: &str,
+    ) -> Option<Self> {
+        let (provider, remote) = parse_git_remote_url(registry, url)?;
+        if !provider.supports_github_pull_requests() {
+            return None;
+        }
+        let base_url = provider.base_url();
+        if base_url.scheme() != "https"
+            || base_url.path() != "/"
+            || !base_url.username().is_empty()
+            || base_url.password().is_some()
+            || base_url.port().is_some()
+            || base_url.query().is_some()
+            || base_url.fragment().is_some()
+        {
+            return None;
+        }
+        let parsed_url = RemoteUrl::from_str(url).ok()?;
+        if parsed_url.query().is_some()
+            || parsed_url.fragment().is_some()
+            || parsed_url.path().trim_matches('/').split('/').count() != 2
+        {
+            return None;
+        }
+        let owner = remote.owner.as_ref();
+        let name = remote.repo.as_ref();
         let valid = |component: &str| {
             !component.is_empty()
                 && !component.starts_with('-')
@@ -36,6 +57,7 @@ impl GitHubRepository {
             return None;
         }
         Some(Self {
+            host: base_url.host_str()?.into(),
             owner: owner.into(),
             name: name.into(),
         })
@@ -45,8 +67,12 @@ impl GitHubRepository {
         format!("{}/{}", self.owner, self.name)
     }
 
+    pub(super) fn target(&self) -> String {
+        format!("{}/{}", self.host, self.slug())
+    }
+
     pub(super) fn pull_request_url(&self, number: u64) -> String {
-        format!("https://github.com/{}/pull/{number}", self.slug())
+        format!("https://{}/pull/{number}", self.target())
     }
 }
 
@@ -118,14 +144,17 @@ impl GitHubPullRequestService {
         repository: &GitHubRepository,
         filter: PullRequestFilter,
     ) -> Result<Vec<PullRequestSummary>> {
-        parse_list(&run_gh(list_arguments(repository, filter)).await?)
+        parse_list(&run_gh(repository, list_arguments(repository, filter)).await?)
     }
 
     pub(super) async fn detail(
         repository: &GitHubRepository,
         number: u64,
     ) -> Result<PullRequestDetail> {
-        parse_detail(&run_gh(detail_arguments(repository, number)).await?, number)
+        parse_detail(
+            &run_gh(repository, detail_arguments(repository, number)).await?,
+            number,
+        )
     }
 }
 
@@ -134,7 +163,7 @@ fn list_arguments(repository: &GitHubRepository, filter: PullRequestFilter) -> V
         "pr",
         "list",
         "--repo",
-        &format!("github.com/{}", repository.slug()),
+        &repository.target(),
         "--state",
         "open",
         "--limit",
@@ -164,7 +193,7 @@ fn detail_arguments(repository: &GitHubRepository, number: u64) -> Vec<String> {
         "view",
         &number.to_string(),
         "--repo",
-        &format!("github.com/{}", repository.slug()),
+        &repository.target(),
         "--json",
         DETAIL_FIELDS,
     ]
@@ -173,12 +202,12 @@ fn detail_arguments(repository: &GitHubRepository, number: u64) -> Vec<String> {
     .collect()
 }
 
-async fn run_gh(arguments: Vec<String>) -> Result<Vec<u8>> {
+async fn run_gh(repository: &GitHubRepository, arguments: Vec<String>) -> Result<Vec<u8>> {
     let output = new_command("gh")
         .args(arguments)
         // An explicit repository and a neutral cwd prevent local repository configuration from choosing the target.
         .current_dir(std::env::temp_dir())
-        .env("GH_HOST", "github.com")
+        .env("GH_HOST", &repository.host)
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1")
         .env("GH_NO_EXTENSION_UPDATE_NOTIFIER", "1")
@@ -187,7 +216,7 @@ async fn run_gh(arguments: Vec<String>) -> Result<Vec<u8>> {
         .kill_on_drop(true)
         .output()
         .await
-        .context("Could not run GitHub CLI (gh). Install gh and authenticate with gh auth login outside Zed, then refresh")?;
+        .with_context(|| format!("Could not run GitHub CLI (gh). Install gh and authenticate with gh auth login --hostname {} outside Zed, then refresh", repository.host))?;
     ensure!(
         output.status.success(),
         "GitHub CLI failed ({}): {}. Check gh auth status, repository access, and GitHub rate limits, then refresh. Zed does not start interactive login",
@@ -234,6 +263,40 @@ fn parse_detail(bytes: &[u8], number: u64) -> Result<PullRequestDetail> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use git_hosting_providers::{Github, Gitlab};
+
+    fn parse_remote(url: &str) -> Option<GitHubRepository> {
+        let registry = Arc::new(GitHostingProviderRegistry::new());
+        registry.register_hosting_provider(Arc::new(Github::public_instance()));
+        registry.register_hosting_provider(Arc::new(Github::new(
+            "Company code",
+            "https://github.enterprise.test".parse().expect("base URL"),
+        )));
+        registry.register_hosting_provider(Arc::new(Github::new(
+            "Configured custom host",
+            "https://code.example.test".parse().expect("base URL"),
+        )));
+        registry.register_hosting_provider(Arc::new(Gitlab::public_instance()));
+        GitHubRepository::from_remote_url(registry, url)
+    }
+
+    #[test]
+    fn test_enterprise_pr_target() {
+        let repository = parse_remote("git@github.enterprise.test:team/project.git")
+            .expect("Enterprise GitHub remote");
+        assert_eq!(
+            repository.pull_request_url(42),
+            "https://github.enterprise.test/team/project/pull/42"
+        );
+        assert_eq!(
+            list_arguments(&repository, PullRequestFilter::All)[3],
+            "github.enterprise.test/team/project"
+        );
+        assert_eq!(
+            detail_arguments(&repository, 42)[4],
+            "github.enterprise.test/team/project"
+        );
+    }
 
     #[test]
     fn test_github_pull_requests_remote_parsing() {
@@ -243,11 +306,11 @@ mod tests {
             "ssh://git@github.com/zed-industries/zed",
             "https://github.com/zed-industries/zed/",
         ] {
-            let repository = GitHubRepository::from_remote_url(url).expect("GitHub remote");
+            let repository = parse_remote(url).expect("GitHub remote");
             assert_eq!(repository.slug(), "zed-industries/zed");
         }
         assert_eq!(
-            GitHubRepository::from_remote_url("https://github.com/owner/.github.git")
+            parse_remote("https://github.com/owner/.github.git")
                 .expect("dot-prefixed repository")
                 .slug(),
             "owner/.github"
@@ -255,7 +318,6 @@ mod tests {
         for url in [
             "https://github.example.com/owner/repo",
             "https://github.com.evil.test/owner/repo",
-            "https://token@github.com/owner/repo",
             "https://github.com/owner/repo?query",
             "https://github.com/owner/repo/extra",
             "https://github.com/../repo",
@@ -265,14 +327,31 @@ mod tests {
             "file:///repo",
             "git@other:owner/repo",
         ] {
-            assert!(GitHubRepository::from_remote_url(url).is_none(), "{url}");
+            assert!(parse_remote(url).is_none(), "{url}");
         }
     }
 
     #[test]
+    fn test_configured_pr_provider() {
+        for url in [
+            "https://user@code.example.test/team/project.git",
+            "git@code.example.test:team/project.git",
+            "ssh://git@code.example.test:2222/team/project.git",
+        ] {
+            let repository = parse_remote(url).expect("configured GitHub provider");
+            assert_eq!(repository.target(), "code.example.test/team/project");
+            assert_eq!(
+                repository.pull_request_url(1),
+                "https://code.example.test/team/project/pull/1"
+            );
+        }
+        assert!(parse_remote("git@gitlab.com:team/project.git").is_none());
+        assert!(parse_remote("git@unconfigured.example.test:team/project.git").is_none());
+    }
+
+    #[test]
     fn test_github_pull_requests_arguments_are_bounded_and_explicit() {
-        let repository = GitHubRepository::from_remote_url("git@github.com:owner/repo.git")
-            .expect("GitHub remote");
+        let repository = parse_remote("git@github.com:owner/repo.git").expect("GitHub remote");
         for (filter, expected) in [
             (PullRequestFilter::All, vec![]),
             (PullRequestFilter::Assigned, vec!["--assignee", "@me"]),
