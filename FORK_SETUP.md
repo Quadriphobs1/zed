@@ -11,6 +11,8 @@ Keep this file and `.pi/APPEND_SYSTEM.md` exclusively on `fork/agent-instruction
 | `dev` | Combined personal build | Merge `main` and selected features |
 | `fork/agent-instructions` | Portable agent setup | Separate maintenance branch |
 
+Use one checkout and switch branches. Minimize worktrees; ask before creating another checkout. Do not switch branches while another process or agent is writing source files.
+
 An unpublished dependency requires a stack: branch from that specific feature, not `dev`. Keep personal-only changes on separate branches and integrate them into `dev` too.
 
 ## New computer
@@ -32,7 +34,7 @@ Stop if `main` diverges; never reset it automatically. Once `dev` has been publi
 
 ## Bootstrap or refresh instructions
 
-Run from each code worktree before starting its agent. This fetches the canonical branch, backs up a differing local copy outside the checkout, and installs the ignored instructions. It refuses to overwrite a tracked instruction file. Inspect any backup and reconcile personal edits before reloading.
+Run from the code checkout before starting its agent. First compare the local guidance branch with the fetched remote: retain reviewed unpublished local commits, and stop on divergence or unknown edits. Select the local mode below when those commits are newer than the remote. This command fetches in remote mode, backs up a differing local copy outside the checkout, and installs the ignored instructions. It refuses to overwrite a tracked instruction file. Inspect any backup and reconcile personal edits before reloading.
 
 ```sh
 (
@@ -78,21 +80,21 @@ Ignored files survive branch switches but are not copied into new worktrees. Rem
 
 ## Start an independent feature
 
-Keep the original checkout on `dev` for the daily-use build. With a clean checkout and no other worktree owning `main`:
+From the same checkout, with no uncommitted changes:
 
 ```sh
 git fetch upstream main
 git switch main
 git merge --ff-only upstream/main
-git switch dev
-git worktree add -b feature/example ../zed-example main
+git switch -c feature/example main
 ```
 
-If another worktree owns `main`, fast-forward it there instead. Install instructions in `../zed-example` before starting the agent. Implement, test, and obtain two independent subagent reviews before committing. A customized Zed binary can edit this independent checkout.
+Implement, test, and obtain two independent subagent reviews before committing. The ignored instructions remain available across code-branch switches. A running customized Zed can edit this checkout after switching source branches; rebuilding replaces the shared build output.
 
-After the feature is reviewed and committed, integrate it from the clean `dev` worktree:
+After the feature is reviewed and committed, integrate it in the same clean checkout:
 
 ```sh
+git switch dev
 git merge --no-ff feature/example
 ```
 
@@ -100,9 +102,9 @@ Test/build the combined app. Make subsequent feature fixes on `feature/example` 
 
 ## Sync upstream
 
-1. Fetch upstream and fast-forward `main` in its owning worktree.
-2. Merge `main` into active feature branches in their worktrees. Avoid rewriting published history.
-3. In the clean `dev` worktree, merge `main`, then updated feature branches.
+1. From a clean checkout, fetch upstream, switch to `main`, and fast-forward it.
+2. Switch to each active feature branch and merge `main`. Avoid rewriting published history.
+3. Switch to `dev` and merge `main`, then updated feature branches.
 4. Review integration changes and run relevant tests/builds.
 5. Push approved branches only after explicit user approval. Local commits are not a remote backup.
 
@@ -110,15 +112,21 @@ Do not reset or force-push to resolve divergence. Decide how to reconcile it wit
 
 ## Maintain guidance
 
-Use a separate worktree to avoid replacing ignored copies while switching to a branch that tracks the same path:
+Use branch switching, not another worktree. First verify the checkout is clean and preserve `.pi/APPEND_SYSTEM.md` outside the checkout: this branch tracks that path, so switching to it can overwrite the ignored copy.
 
 ```sh
-git worktree add ../zed-agent-instructions fork/agent-instructions
+(
+    set -eu
+    backup=$(mktemp "${TMPDIR:-/tmp}/zed-fork-instructions.XXXXXX")
+    cp .pi/APPEND_SYSTEM.md "$backup"
+    printf 'Saved local instructions to %s\n' "$backup"
+    git switch fork/agent-instructions
+)
 ```
 
-If the branch is not local yet, first fetch it and create it with `git branch --track fork/agent-instructions origin/fork/agent-instructions`. If its worktree already exists, use that worktree.
+If the branch is not local yet, first fetch it and create it with `git branch --track fork/agent-instructions origin/fork/agent-instructions`. Inspect and reconcile the backup before editing; preserve needed edits outside temporary storage.
 
-Edit only personal setup files there, review, and commit. Publish with approval, then repeat bootstrap in every active code worktree and reload Pi. Until published, explicitly bootstrap from the local branch. Never merge the instruction branch into `dev` or a contribution branch.
+Edit only personal setup files, review, and commit. Switch back to the previous code branch. Switching away removes the tracked instruction file, so immediately reinstall it using the bootstrap command with `instructions_ref=fork/agent-instructions`, then reload Pi. Publish only with approval. Never merge the instruction branch into `dev` or a contribution branch.
 
 ## Before an upstream PR
 

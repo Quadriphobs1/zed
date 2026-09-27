@@ -10,16 +10,17 @@ Follow upstream AGENTS.md and crate instructions as well as this guidance.
 - `feature/<name>` contains one reviewable contribution, based on freshly synced `main`. Personal-only changes also get separate branches, integrated into `dev`.
 - If work depends on an unpublished feature, branch from that specific feature and record the dependency. Treat it as a stacked contribution, not an independent PR.
 - `fork/agent-instructions` holds personal setup only. Never merge or cherry-pick it into `main`, `dev`, or feature branches.
+- Use one checkout and switch branches by default. Minimize worktrees; ask before creating an extra checkout. Do not run concurrent writers while switching branches.
 
 ## Start work
 
 1. Inspect status, branch, worktrees, remotes, and this instruction copy. Stop on unexpected changes; never automatically reset, stash, or discard work.
-2. Before a new task, fetch `origin fork/agent-instructions` and compare its `.pi/APPEND_SYSTEM.md` with the local copy. If different, read the updated `FORK_SETUP.md`, preserve local edits, reinstall, and reload Pi before implementation. If fetching fails, report that freshness is unverified.
-3. Fetch upstream and fast-forward `main` in its owning worktree. If no worktree owns `main`, update it from a clean checkout, then return to `dev`. Stop on divergence.
-4. For an independent feature, create a separate worktree from `main`, using `git worktree add -b feature/<name> ../zed-<name> main`. Install the ignored instructions in that worktree before starting its agent.
-5. Implement and test only the feature there. The running customized Zed can edit this worktree; it need not be built from the checkout being edited.
+2. Before a new task, fetch `origin fork/agent-instructions` and compare it with the local guidance branch and installed copy. Preserve reviewed unpublished local guidance; do not replace it with an older remote version. On divergence or unknown local edits, ask before reconciling. Read the selected branch's `FORK_SETUP.md`, reinstall if needed, and reload Pi. If fetching fails, report that freshness is unverified.
+3. From a clean checkout, fetch upstream, switch to `main`, and run `git merge --ff-only upstream/main`. Stop on divergence.
+4. For an independent feature, run `git switch -c feature/<name> main` in this same checkout. Resume existing work by switching to its feature branch instead.
+5. Implement and test only that feature. A running customized Zed can edit this checkout even though its source branch has changed. Rebuilding replaces the shared build output; return to `dev` to rebuild the combined app.
 6. Complete at least two independent subagent reviews before committing changes. Fix findings and run relevant checks; report actual evidence and gaps.
-7. Merge the reviewed feature into `dev` in the integration worktree, then test/build the combined app. Resolve integration-only conflicts there; put feature fixes on the owning feature branch and merge them forward again.
+7. With a clean checkout, switch to `dev`, merge the reviewed feature, then test/build the combined app. Resolve integration-only conflicts there; put feature fixes on the owning feature branch and merge them forward again.
 
 ## Sync and publish
 
@@ -33,7 +34,7 @@ Follow upstream AGENTS.md and crate instructions as well as this guidance.
 - Canonical guidance lives on `fork/agent-instructions`; `FORK_SETUP.md` contains the bootstrap command. Agents cannot read instructions merely because another branch contains them.
 - Each code worktree needs an ignored local `.pi/APPEND_SYSTEM.md`. Branch switches retain that copy, but linked worktrees do not inherit it. Updates are not automatic.
 - Start Pi from the worktree root, grant project trust, and reload existing sessions after refreshing. A project append file replaces a user-level append file; reconcile both if needed. Other agent tools require their own instruction-loading setup.
-- Edit canonical guidance in a dedicated `fork/agent-instructions` worktree. Commit only setup files, publish with approval, and refresh every active code worktree. For unpublished guidance, bootstrap from the reviewed local branch explicitly.
+- To edit canonical guidance, first preserve the ignored copy outside the checkout, then switch to `fork/agent-instructions`. This branch tracks the same path, so checkout can replace it. Commit only setup files, switch back, and reinstall the reviewed local instructions immediately: switching away removes the tracked file. Publish only with approval.
 - Never force-add local copies. Exclusions do not protect tracked files. Preserve upstream `.rules`, `AGENTS.md`, and `CLAUDE.md` rather than placing personal workflow in them.
 
 ## Before an upstream PR
