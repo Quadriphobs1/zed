@@ -175,6 +175,10 @@ impl GitHostingProvider for Github {
         self.base_url.clone()
     }
 
+    fn supports_github_pull_requests(&self) -> bool {
+        true
+    }
+
     fn supports_avatars(&self) -> bool {
         // Avatars are not supported for self-hosted GitHub instances
         // See tracking issue: https://github.com/zed-industries/zed/issues/11043
