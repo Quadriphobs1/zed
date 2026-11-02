@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result, ensure};
 use db::kvp::KeyValueStore;
-use git::Oid;
+use git::{Oid, repository::RevisionDiffMode};
 use gpui::{
     App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, ScrollHandle,
     ScrollStrategy, Task, UniformListScrollHandle, WeakEntity, Window, uniform_list,
@@ -29,6 +29,15 @@ use crate::github_pull_requests::{
 };
 use crate::pull_request_cache::{CachePolicy, PullRequestCache};
 use crate::revision_diff::RevisionDiffView;
+
+mod activity;
+use activity::{ActivityReloaded, PreviewState, PullRequestActivity};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DetailSection {
+    Description,
+    Activity,
+}
 
 const REMOTE_SELECTION_KEY: &str = "pull-request-browser-remote";
 const DESCRIPTION_WIDTH_REMS: f32 = 60.0;
@@ -612,6 +621,13 @@ impl Render for PullRequestBrowser {
     }
 }
 
+struct PreviewRequest {
+    generation: usize,
+    mode: RevisionDiffMode,
+    repository: Entity<Repository>,
+    title: SharedString,
+}
+
 struct PullRequestDescription {
     project: Entity<Project>,
     repository: Option<Entity<Repository>>,
@@ -628,7 +644,11 @@ struct PullRequestDescription {
     diff_loading: bool,
     diff_error: Option<String>,
     diff_task: Task<()>,
+    preview_generation: usize,
     details_expanded: bool,
+    section: DetailSection,
+    activity: Option<Entity<PullRequestActivity>>,
+    activity_subscription: Option<gpui::Subscription>,
     scroll_handle: ScrollHandle,
 }
 
@@ -661,7 +681,11 @@ impl PullRequestDescription {
             diff_loading: false,
             diff_error: None,
             diff_task: Task::ready(()),
+            preview_generation: 0,
             details_expanded: false,
+            section: DetailSection::Description,
+            activity: None,
+            activity_subscription: None,
             scroll_handle: ScrollHandle::new(),
         };
         this.load_detail(CachePolicy::PreferCache, cx);
@@ -670,6 +694,128 @@ impl PullRequestDescription {
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
         self.load_detail(CachePolicy::Reload, cx);
+        if let Some(activity) = &self.activity {
+            activity.update(cx, |activity, cx| activity.refresh(cx));
+        }
+    }
+
+    fn toggle_activity(&mut self, cx: &mut Context<Self>) {
+        self.section = match self.section {
+            DetailSection::Description => DetailSection::Activity,
+            DetailSection::Activity => DetailSection::Description,
+        };
+        self.scroll_handle.set_offset(gpui::Point::default());
+        if self.section == DetailSection::Activity && self.activity.is_none() {
+            let description = cx.weak_entity();
+            let on_commit = std::rc::Rc::new(move |commit, window: &mut Window, cx: &mut App| {
+                description
+                    .update(cx, |this, cx| this.open_commit(commit, window, cx))
+                    .log_err();
+            });
+            let activity = cx.new(|cx| {
+                PullRequestActivity::new(
+                    self.project.clone(),
+                    self.target.clone(),
+                    self.number,
+                    self.scroll_handle.clone(),
+                    on_commit,
+                    cx,
+                )
+            });
+            self.activity_subscription = Some(cx.subscribe(
+                &activity,
+                |this, _, _: &ActivityReloaded, cx| {
+                    // The child resets its busy state; do not update a potentially leased emitter.
+                    this.cancel_diff();
+                    cx.notify();
+                },
+            ));
+            activity.update(cx, |activity, cx| {
+                activity.set_preview(
+                    if self.diff_loading {
+                        PreviewState::Loading
+                    } else {
+                        PreviewState::Ready
+                    },
+                    cx,
+                );
+                activity.refresh(cx);
+            });
+            self.activity = Some(activity);
+        }
+        cx.notify();
+    }
+
+    fn open_commit(&mut self, commit: Oid, window: &mut Window, cx: &mut Context<Self>) {
+        if self.diff_loading {
+            return;
+        }
+        let result = check_access(&self.project, cx).and_then(|()| {
+            self.repository
+                .clone()
+                .context("The PR repository is no longer available")
+        });
+        let repository = match result {
+            Ok(repository) => repository,
+            Err(error) => {
+                self.diff_error = Some(format!("{error:#}"));
+                cx.notify();
+                return;
+            }
+        };
+        let source = format!("https://{}.git", self.target.target());
+        let response = repository.update(cx, |repository, cx| {
+            repository.fetch_pr_commit(source, commit, cx)
+        });
+        let title = format!("{} #{} commit {}", self.target.slug(), self.number, commit).into();
+        self.show_diff(
+            response,
+            repository,
+            title,
+            RevisionDiffMode::Direct,
+            window,
+            cx,
+        );
+    }
+
+    fn cancel_diff(&mut self) {
+        self.preview_generation += 1;
+        self.diff_task = Task::ready(());
+        self.diff_loading = false;
+        self.diff_error = None;
+    }
+
+    fn show_diff(
+        &mut self,
+        response: Task<Result<RevisionDiff>>,
+        repository: Entity<Repository>,
+        title: SharedString,
+        mode: RevisionDiffMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.preview_generation += 1;
+        let request = PreviewRequest {
+            generation: self.preview_generation,
+            mode,
+            repository,
+            title,
+        };
+        self.diff_error = None;
+        self.diff_loading = true;
+        if let Some(activity) = &self.activity {
+            activity.update(cx, |activity, cx| {
+                activity.set_preview(PreviewState::Loading, cx)
+            });
+        }
+        self.diff_task = cx.spawn_in(window, async move |this, cx| {
+            let result = response.await;
+            cx.update(|window, cx| {
+                Self::finish_diff(&this, result, request, window, cx);
+            })
+            .log_err();
+        });
+        cx.notify();
     }
 
     fn set_detail(&mut self, detail: PullRequestDetail, cx: &mut Context<Self>) {
@@ -706,45 +852,63 @@ impl PullRequestDescription {
                 return;
             }
         };
-        self.diff_error = None;
-        self.diff_loading = true;
         let source = format!("https://{}.git", self.target.target());
         let head_ref = format!("refs/pull/{}/head", self.number);
         let response = repository.update(cx, |repository, cx| {
             repository.fetch_pr_objects(source, base, head, head_ref, cx)
         });
         let title: SharedString = format!("{} #{} changes", self.target.slug(), self.number).into();
-        self.diff_task = cx.spawn_in(window, async move |this, cx| {
-            let result = response.await;
-            cx.update(|window, cx| {
-                Self::finish_diff(&this, result, repository, title, window, cx);
-            })
-            .log_err();
-        });
-        cx.notify();
+        self.show_diff(
+            response,
+            repository,
+            title,
+            RevisionDiffMode::MergeBase,
+            window,
+            cx,
+        );
     }
 
     fn finish_diff(
         this: &WeakEntity<Self>,
         result: Result<RevisionDiff>,
-        repository: Entity<Repository>,
-        title: SharedString,
+        request: PreviewRequest,
         window: &mut Window,
         cx: &mut App,
     ) {
+        let Some((project, workspace)) = this
+            .read_with(cx, |this, _| {
+                (this.preview_generation == request.generation)
+                    .then(|| (this.project.clone(), this.workspace.clone()))
+            })
+            .log_err()
+            .flatten()
+        else {
+            return;
+        };
         let result = (|| {
             let snapshot = result?;
-            let (project, workspace) =
-                this.read_with(cx, |this, _| (this.project.clone(), this.workspace.clone()))?;
             check_access(&project, cx)?;
 
             // Adding a pane item reads existing items; do not hold the description's lease.
             workspace.update(cx, |workspace, cx| {
-                RevisionDiffView::open_snapshot(workspace, repository, snapshot, title, window, cx);
+                RevisionDiffView::open_snapshot(
+                    workspace,
+                    request.repository,
+                    snapshot,
+                    request.mode,
+                    request.title,
+                    window,
+                    cx,
+                );
             })
         })();
         this.update(cx, |this, cx| {
             this.diff_loading = false;
+            if let Some(activity) = &this.activity {
+                activity.update(cx, |activity, cx| {
+                    activity.set_preview(PreviewState::Ready, cx)
+                });
+            }
             this.diff_error = result.err().map(|error| format!("{error:#}"));
             cx.notify();
         })
@@ -752,9 +916,12 @@ impl PullRequestDescription {
     }
 
     fn load_detail(&mut self, policy: CachePolicy, cx: &mut Context<Self>) {
-        self.diff_task = Task::ready(());
-        self.diff_loading = false;
-        self.diff_error = None;
+        self.cancel_diff();
+        if let Some(activity) = &self.activity {
+            activity.update(cx, |activity, cx| {
+                activity.set_preview(PreviewState::Ready, cx)
+            });
+        }
         self.task = Task::ready(());
         self.detail = None;
         self.markdown = None;
@@ -994,6 +1161,24 @@ impl PullRequestDescription {
                                         cx.notify();
                                     })),
                             ),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "pr-activity-toggle".into())
+                            .flex_none()
+                            .child(
+                                Button::new(
+                                    "pr-activity-toggle",
+                                    if self.section == DetailSection::Description {
+                                        "Activity"
+                                    } else {
+                                        "Description"
+                                    },
+                                )
+                                .tab_index(0_isize)
+                                .toggle_state(self.section == DetailSection::Activity)
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_activity(cx))),
+                            ),
                     ),
             )
             .when(self.loading, |this| {
@@ -1009,7 +1194,7 @@ impl PullRequestDescription {
             })
             .when(self.diff_loading, |this| {
                 this.child(
-                    Label::new("Preparing PR changes…")
+                    Label::new("Preparing changes…")
                         .size(LabelSize::Small)
                         .color(Color::Muted),
                 )
@@ -1130,7 +1315,11 @@ impl PullRequestDescription {
 
 impl Render for PullRequestDescription {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let markdown = self.render_markdown();
+        let markdown = if self.section == DetailSection::Description {
+            self.render_markdown()
+        } else {
+            None
+        };
         v_flex()
             .id("pr-description")
             .size_full()
@@ -1157,6 +1346,9 @@ impl Render for PullRequestDescription {
                             .gap_4()
                             .when(self.details_expanded, |this| {
                                 this.child(self.render_details(cx))
+                            })
+                            .when(self.section == DetailSection::Activity, |this| {
+                                this.children(self.activity.clone())
                             })
                             .when_some(markdown, |this, markdown| {
                                 // Preview typography belongs to the body, not the native controls.
@@ -1250,6 +1442,10 @@ mod tests {
             cx.run_until_parked();
             let header = cx.debug_bounds("pr-header").expect("native header");
             let actions = cx.debug_bounds("pr-actions").expect("native actions");
+            assert!(
+                cx.debug_bounds("pr-activity-toggle").is_some(),
+                "activity navigation in native header"
+            );
             let body = cx.debug_bounds("pr-body").expect("scrolling body");
             assert!(header.right() <= px(width));
             assert!(actions.right() <= px(width));
@@ -1310,6 +1506,8 @@ mod tests {
             assert!(expanded.bottom() <= body.bottom());
             assert!(expanded.left() >= body.left() && expanded.right() <= body.right());
 
+            // The Activity navigation follows Details before the expanded SHA controls.
+            cx.update(|window, cx| window.focus_next(cx));
             for expected in ["1".repeat(40), "2".repeat(40)] {
                 cx.update(|window, cx| window.focus_next(cx));
                 press_enter(&mut cx);
@@ -1863,8 +2061,12 @@ mod tests {
                     PullRequestDescription::finish_diff(
                         &description.downgrade(),
                         result,
-                        repository.clone(),
-                        "PR changes".into(),
+                        PreviewRequest {
+                            generation: description.read(cx).preview_generation,
+                            mode: RevisionDiffMode::MergeBase,
+                            repository: repository.clone(),
+                            title: "PR changes".into(),
+                        },
                         window,
                         cx,
                     );
