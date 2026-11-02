@@ -55,6 +55,7 @@ pub mod multi_diff_view;
 pub mod picker_prompt;
 pub mod project_diff;
 mod pull_request_browser;
+mod pull_request_cache;
 pub(crate) mod remote_output;
 pub mod repository_selector;
 pub(crate) mod revision_diff;

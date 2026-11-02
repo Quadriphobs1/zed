@@ -28,7 +28,7 @@ use std::sync::atomic::AtomicBool;
 
 use std::process::{ExitStatus, Output};
 use std::str::FromStr;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use std::{
     cmp::Ordering,
     path::{Path, PathBuf},
@@ -45,6 +45,9 @@ use uuid::Uuid;
 pub use askpass::{AskPassDelegate, AskPassResult, AskPassSession};
 
 pub const REMOTE_CANCELLED_BY_USER: &str = "Operation cancelled by user";
+const OBJECT_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
+const OBJECT_FETCH_ERROR_LIMIT: usize = 4096;
+const GH_CREDENTIAL_HELPER: &str = "!gh auth git-credential";
 
 /// Format string used in graph log to get initial data for the git graph
 /// %H - Full commit hash
@@ -544,6 +547,12 @@ pub enum RevisionDiffMode {
     MergeBase,
 }
 
+#[derive(Clone, Copy)]
+pub enum ObjectFetchAuth {
+    Configured,
+    GitHubCli,
+}
+
 #[derive(Debug)]
 pub struct RevisionDiff {
     /// The effective old-side commit, which may be a merge base rather than the input base.
@@ -1036,6 +1045,19 @@ pub trait GitRepository: Send + Sync {
         path: RepoPath,
         revision: Oid,
     ) -> BoxFuture<'_, Result<crate::blame::Blame>>;
+
+    /// Fetch pinned comparison objects without updating refs, FETCH_HEAD, index or worktree.
+    fn fetch_objects(
+        &self,
+        _source: String,
+        _base: Oid,
+        _head: Oid,
+        _head_ref: String,
+        _auth: ObjectFetchAuth,
+        _cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<()>> {
+        async { bail!("object-only fetching is not supported by this repository backend") }.boxed()
+    }
 
     /// Returns the absolute path to the repository. For worktrees, this will be the path to the
     /// worktree's gitdir within the main repository (typically `.git/worktrees/<name>`).
@@ -3067,6 +3089,65 @@ impl GitRepository for RealGitRepository {
         .boxed()
     }
 
+    fn fetch_objects(
+        &self,
+        source: String,
+        base: Oid,
+        head: Oid,
+        head_ref: String,
+        auth: ObjectFetchAuth,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary().envs(HashMap::from_iter([
+            ("GIT_NO_LAZY_FETCH".into(), "1".into()),
+            ("GIT_NO_REPLACE_OBJECTS".into(), "1".into()),
+        ]));
+        let executor = cx.background_executor().clone();
+        cx.background_spawn(async move {
+            anyhow::ensure!(git.is_trusted, "Trust this repository before fetching PR objects");
+            anyhow::ensure!(git.run(&["rev-parse", "--is-shallow-repository"]).await?.trim() == "false",
+                "PR comparisons require complete history; fetch full history explicitly before retrying");
+            let has_commit = async |revision: Oid| {
+                git.run(&["cat-file", "-e", &format!("{revision}^{{commit}}")]).await.is_ok()
+            };
+            if has_commit(base).await && has_commit(head).await {
+                return Ok(());
+            }
+            anyhow::ensure!(head_ref.starts_with("refs/"), "Expected a full remote reference");
+            git.run(&["check-ref-format", &head_ref]).await.context("Invalid remote reference")?;
+            if matches!(auth, ObjectFetchAuth::GitHubCli) {
+                let url = url::Url::parse(&source).context("Invalid PR repository URL")?;
+                anyhow::ensure!(url.scheme() == "https" && url.username().is_empty() && url.password().is_none()
+                    && url.host_str().is_some() && url.port().is_none() && url.query().is_none() && url.fragment().is_none(),
+                    "PR object fetching requires an HTTPS repository URL without credentials");
+                let effective = git.run(&["ls-remote", "--get-url", "--", &source]).await.context("Resolving PR fetch URL")?;
+                anyhow::ensure!(effective.trim() == source,
+                    "Git configuration rewrites the PR repository URL; remove its url.*.insteadOf rule before previewing changes");
+            }
+            // Explicit source-only refspecs and an empty refmap prevent configured fetch mappings
+            // from updating branches. Suppress every other fetch side effect as well.
+            let mut command = git.object_fetch_command(&source, auth, &[
+                "fetch", "--no-tags", "--no-prune", "--no-write-fetch-head", "--no-recurse-submodules",
+                "--no-auto-maintenance", "--refmap=", "--", &source, &base.to_string(), &head_ref,
+            ]);
+            command.env("GIT_TERMINAL_PROMPT", "0").env("GH_PROMPT_DISABLED", "1")
+                .env("GCM_INTERACTIVE", "never").env_remove("GIT_ASKPASS").env_remove("SSH_ASKPASS")
+                .stdin(Stdio::null()).kill_on_drop(true);
+            let output = command.output().fuse();
+            let timeout = executor.timer(OBJECT_FETCH_TIMEOUT).fuse();
+            futures::pin_mut!(output, timeout);
+            let output = select_biased! {
+                result = output => result.context("Fetching PR objects")?,
+                () = timeout => bail!("Fetching PR objects timed out; retry after checking connectivity"),
+            };
+            anyhow::ensure!(output.status.success(), "Could not fetch PR objects: {}. Check gh authentication and repository access, then refresh the PR description",
+                String::from_utf8_lossy(&output.stderr).chars().take(OBJECT_FETCH_ERROR_LIMIT).collect::<String>());
+            anyhow::ensure!(has_commit(base).await && has_commit(head).await,
+                "The pinned PR revisions are unavailable; the PR may have been force-pushed. Refresh its description and retry");
+            Ok(())
+        }).boxed()
+    }
+
     fn get_push_remote(&self, branch: String) -> BoxFuture<'_, Result<Option<Remote>>> {
         let git = self.git_binary();
         self.executor
@@ -3898,6 +3979,41 @@ impl GitBinary {
         self.build_command_with_config(&[], args)
     }
 
+    fn object_fetch_command(
+        &self,
+        source: &str,
+        auth: ObjectFetchAuth,
+        args: &[&str],
+    ) -> util::command::Command {
+        let redirect_key = format!("http.{source}.followRedirects");
+        let credential_key = format!("credential.{source}.helper");
+        let mut config = vec![
+            ("core.hooksPath", "/dev/null"),
+            ("fetch.writeCommitGraph", "false"),
+            ("gc.auto", "0"),
+            ("credential.interactive", "false"),
+            ("core.askPass", ""),
+        ];
+        if matches!(auth, ObjectFetchAuth::GitHubCli) {
+            config.extend([
+                ("credential.helper", ""),
+                ("credential.helper", GH_CREDENTIAL_HELPER),
+                (&credential_key, ""),
+                (&credential_key, GH_CREDENTIAL_HELPER),
+                ("protocol.allow", "never"),
+                ("protocol.https.allow", "always"),
+                ("http.followRedirects", "false"),
+                (&redirect_key, "false"),
+            ]);
+        }
+        let mut command = self.build_command_with_config(&config, args);
+        if matches!(auth, ObjectFetchAuth::GitHubCli) {
+            // Unlike protocol.allow, this whitelist overrides per-protocol policies.
+            command.env("GIT_ALLOW_PROTOCOL", "https");
+        }
+        command
+    }
+
     #[allow(clippy::disallowed_methods)]
     fn build_command_with_config<S>(
         &self,
@@ -4474,6 +4590,263 @@ mod tests {
         assert_eq!(
             fs::canonicalize(left.as_ref()).unwrap(),
             fs::canonicalize(right.as_ref()).unwrap()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_pr_fetch_rewrite(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().expect("repository fixture");
+        let (remote, clone) = clone_remote_repository_with_main_and_feature(directory.path());
+        let seed = directory.path().join("seed");
+        let base = git_command_output(&clone, ["rev-parse", "HEAD"])
+            .parse()
+            .expect("base commit");
+        fs::write(seed.join("feature.txt"), "new PR change").expect("PR content");
+        git_command(&seed, ["commit", "-am", "new PR commit"]);
+        git_command(&seed, ["push", "origin", "HEAD:refs/pull/42/head"]);
+        let head = git_command_output(&seed, ["rev-parse", "HEAD"])
+            .parse()
+            .expect("head commit");
+        const PR_URL: &str = "https://github.com/example/project.git";
+        git_command(
+            &clone,
+            [
+                "config",
+                &format!("url.{}.insteadOf", remote.display()),
+                PR_URL,
+            ],
+        );
+        git_command(&clone, ["config", "protocol.file.allow", "always"]);
+        let repository =
+            RealGitRepository::new(&clone.join(".git"), None, Some("git".into()), cx.executor())
+                .expect("repository");
+        repository.set_trusted(true);
+        let result = repository
+            .fetch_objects(
+                PR_URL.into(),
+                base,
+                head,
+                "refs/pull/42/head".into(),
+                ObjectFetchAuth::GitHubCli,
+                cx.to_async(),
+            )
+            .await;
+        let error = result.expect_err("refuse a rewritten HTTPS target");
+        assert!(error.to_string().contains("rewrites the PR repository URL"));
+    }
+
+    #[gpui::test]
+    async fn test_pr_fetch_redirect(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().expect("repository fixture");
+        git_init_repo(directory.path());
+        git_command(
+            directory.path(),
+            ["config", "http.https://github.com/.followRedirects", "true"],
+        );
+        let repository = RealGitRepository::new(
+            &directory.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .expect("repository");
+        repository.set_trusted(true);
+        const PR_URL: &str = "https://github.com/example/project.git";
+        let output = repository
+            .git_binary()
+            .object_fetch_command(
+                PR_URL,
+                ObjectFetchAuth::GitHubCli,
+                &["config", "--get-urlmatch", "http.followRedirects", PR_URL],
+            )
+            .output()
+            .await
+            .expect("inspect effective redirect policy");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "false",
+            "override URL-scoped redirects"
+        );
+        git_command(
+            directory.path(),
+            ["config", "protocol.file.allow", "always"],
+        );
+        let output = repository
+            .git_binary()
+            .object_fetch_command(
+                PR_URL,
+                ObjectFetchAuth::GitHubCli,
+                &[
+                    "ls-remote",
+                    directory.path().to_str().expect("fixture path"),
+                ],
+            )
+            .output()
+            .await
+            .expect("transport guard");
+        assert!(
+            !output.status.success(),
+            "per-protocol config must not bypass HTTPS-only fetching"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("not allowed"));
+        git_command(
+            directory.path(),
+            [
+                "config",
+                "credential.https://github.com/.helper",
+                "different-account-helper",
+            ],
+        );
+        let output = repository
+            .git_binary()
+            .object_fetch_command(
+                PR_URL,
+                ObjectFetchAuth::GitHubCli,
+                &["config", "--get-urlmatch", "credential.helper", PR_URL],
+            )
+            .output()
+            .await
+            .expect("credential policy");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "!gh auth git-credential",
+            "always use the same gh authentication as PR metadata"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_fetch_objects_state(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().expect("repository fixture");
+        let (remote, clone) = clone_remote_repository_with_main_and_feature(directory.path());
+        let seed = directory.path().join("seed");
+        let base: Oid = git_command_output(&clone, ["rev-parse", "HEAD"])
+            .parse()
+            .expect("base commit");
+        fs::write(seed.join("feature.txt"), "new PR change").expect("PR content");
+        git_command(&seed, ["commit", "-am", "new PR commit"]);
+        git_command(&seed, ["push", "origin", "HEAD:refs/pull/42/head"]);
+        let head: Oid = git_command_output(&seed, ["rev-parse", "HEAD"])
+            .parse()
+            .expect("head commit");
+        fs::write(clone.join("file.txt"), "staged local edit").expect("staged content");
+        git_command(&clone, ["add", "file.txt"]);
+        fs::write(clone.join("file.txt"), "unstaged local edit").expect("working content");
+        fs::write(clone.join(".git/FETCH_HEAD"), "existing fetch head\n")
+            .expect("fetch head sentinel");
+        let refs = git_command_output(&clone, ["show-ref"]);
+        let index = fs::read(clone.join(".git/index")).expect("index snapshot");
+        let original_head = fs::read(clone.join(".git/HEAD")).expect("HEAD snapshot");
+        let config = fs::read(clone.join(".git/config")).expect("config snapshot");
+        let repository =
+            RealGitRepository::new(&clone.join(".git"), None, Some("git".into()), cx.executor())
+                .expect("repository");
+        repository.set_trusted(true);
+        repository
+            .fetch_objects(
+                remote.to_string_lossy().into_owned(),
+                base,
+                head,
+                "refs/pull/42/head".into(),
+                ObjectFetchAuth::Configured,
+                cx.to_async(),
+            )
+            .await
+            .expect("fetch PR objects");
+        assert_eq!(git_command_output(&clone, ["show-ref"]), refs);
+        assert_eq!(
+            fs::read(clone.join(".git/index")).expect("index after fetch"),
+            index
+        );
+        assert_eq!(
+            fs::read_to_string(clone.join("file.txt")).expect("working content after fetch"),
+            "unstaged local edit"
+        );
+        assert_eq!(
+            fs::read_to_string(clone.join(".git/FETCH_HEAD")).expect("fetch head after fetch"),
+            "existing fetch head\n"
+        );
+        let diff = repository
+            .load_revision_diff(base, head, RevisionDiffMode::MergeBase, cx.to_async())
+            .await
+            .expect("PR snapshot diff");
+        assert_eq!(diff.base, base);
+        assert_eq!(diff.head, head);
+        assert_eq!(diff.files.len(), 1);
+        assert_eq!(
+            fs::read(clone.join(".git/HEAD")).expect("HEAD after fetch"),
+            original_head
+        );
+        assert_eq!(
+            fs::read(clone.join(".git/config")).expect("config after fetch"),
+            config
+        );
+
+        repository.set_trusted(false);
+        let error = repository
+            .fetch_objects(
+                remote.to_string_lossy().into_owned(),
+                base,
+                head,
+                "refs/pull/42/head".into(),
+                ObjectFetchAuth::Configured,
+                cx.to_async(),
+            )
+            .await
+            .expect_err("untrusted fetch");
+        assert!(error.to_string().contains("Trust this repository"));
+        repository.set_trusted(true);
+        let missing = "f".repeat(40).parse().expect("missing SHA");
+        let error = repository
+            .fetch_objects(
+                remote.to_string_lossy().into_owned(),
+                base,
+                missing,
+                "refs/pull/42/head".into(),
+                ObjectFetchAuth::Configured,
+                cx.to_async(),
+            )
+            .await
+            .expect_err("force-pushed snapshot");
+        assert!(
+            error
+                .to_string()
+                .contains("pinned PR revisions are unavailable")
+        );
+        assert_eq!(git_command_output(&clone, ["show-ref"]), refs);
+        assert_eq!(
+            fs::read(clone.join(".git/index")).expect("index after failed fetch"),
+            index
+        );
+        assert_eq!(
+            fs::read_to_string(clone.join(".git/FETCH_HEAD"))
+                .expect("fetch head after failed fetch"),
+            "existing fetch head\n"
+        );
+        git_command(&clone, ["fetch", "--depth=1", "origin", "main"]);
+        let shallow = fs::read(clone.join(".git/shallow")).expect("shallow fixture");
+        let error = repository
+            .fetch_objects(
+                remote.to_string_lossy().into_owned(),
+                base,
+                head,
+                "refs/pull/42/head".into(),
+                ObjectFetchAuth::Configured,
+                cx.to_async(),
+            )
+            .await
+            .expect_err("shallow comparison");
+        assert!(error.to_string().contains("complete history"));
+        assert_eq!(
+            fs::read(clone.join(".git/shallow")).expect("unchanged shallow boundary"),
+            shallow
         );
     }
 
