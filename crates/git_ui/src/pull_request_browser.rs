@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result, ensure};
 use db::kvp::KeyValueStore;
-use git::{Oid, repository::RevisionDiffMode};
+use git::Oid;
 use gpui::{
     App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, ScrollHandle,
     ScrollStrategy, Task, UniformListScrollHandle, WeakEntity, Window, uniform_list,
@@ -9,7 +9,11 @@ use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont,
     MarkdownStyle, WrapButtonVisibility,
 };
-use project::{Project, git_store::Repository, trusted_worktrees::TrustedWorktrees};
+use project::{
+    Project,
+    git_store::{Repository, RevisionDiff},
+    trusted_worktrees::TrustedWorktrees,
+};
 use settings::Settings;
 use std::str::FromStr as _;
 use theme_settings::ThemeSettings;
@@ -29,7 +33,7 @@ use crate::revision_diff::RevisionDiffView;
 const REMOTE_SELECTION_KEY: &str = "pull-request-browser-remote";
 const DESCRIPTION_WIDTH_REMS: f32 = 60.0;
 const REFRESH_PR_LABEL: &str = "Refresh pull request";
-const PR_FETCH_NOTICE: &str = "Fetches missing Git objects on request. Never checks out a branch or changes staged or unstaged edits.";
+const PR_FETCH_NOTICE: &str = "Downloads bounded PR history into temporary storage. Never changes checkout history, branches, staged or unstaged edits.";
 
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct RemoteSelection {
@@ -713,7 +717,7 @@ impl PullRequestDescription {
         self.diff_task = cx.spawn_in(window, async move |this, cx| {
             let result = response.await;
             cx.update(|window, cx| {
-                Self::finish_diff(&this, result, (repository, base, head), title, window, cx);
+                Self::finish_diff(&this, result, repository, title, window, cx);
             })
             .log_err();
         });
@@ -722,30 +726,21 @@ impl PullRequestDescription {
 
     fn finish_diff(
         this: &WeakEntity<Self>,
-        result: Result<()>,
-        (repository, base, head): (Entity<Repository>, Oid, Oid),
+        result: Result<RevisionDiff>,
+        repository: Entity<Repository>,
         title: SharedString,
         window: &mut Window,
         cx: &mut App,
     ) {
         let result = (|| {
-            result?;
+            let snapshot = result?;
             let (project, workspace) =
                 this.read_with(cx, |this, _| (this.project.clone(), this.workspace.clone()))?;
             check_access(&project, cx)?;
 
             // Adding a pane item reads existing items; do not hold the description's lease.
             workspace.update(cx, |workspace, cx| {
-                RevisionDiffView::open(
-                    workspace,
-                    repository,
-                    base,
-                    head,
-                    RevisionDiffMode::MergeBase,
-                    title,
-                    window,
-                    cx,
-                );
+                RevisionDiffView::open_snapshot(workspace, repository, snapshot, title, window, cx);
             })
         })();
         this.update(cx, |this, cx| {
@@ -1858,22 +1853,23 @@ mod tests {
                     );
                 });
                 project::trusted_worktrees::init(Default::default(), cx);
+                let snapshot = || RevisionDiff {
+                    base: Oid::from_str(&"1".repeat(40)).expect("base"),
+                    head: Oid::from_str(&"2".repeat(40)).expect("head"),
+                    files: Vec::new(),
+                };
                 let complete = |result, window: &mut Window, cx: &mut App| {
                     description.update(cx, |description, _| description.diff_loading = true);
                     PullRequestDescription::finish_diff(
                         &description.downgrade(),
                         result,
-                        (
-                            repository.clone(),
-                            Oid::from_str(&"1".repeat(40)).expect("base"),
-                            Oid::from_str(&"2".repeat(40)).expect("head"),
-                        ),
+                        repository.clone(),
                         "PR changes".into(),
                         window,
                         cx,
                     );
                 };
-                complete(Ok(()), window, cx);
+                complete(Ok(snapshot()), window, cx);
                 assert!(!description.read(cx).diff_loading);
                 assert!(description.read(cx).diff_error.is_some());
                 assert!(
@@ -1909,7 +1905,7 @@ mod tests {
                         .is_some()
                 );
 
-                complete(Ok(()), window, cx);
+                complete(Ok(snapshot()), window, cx);
                 assert!(
                     workspace
                         .read(cx)

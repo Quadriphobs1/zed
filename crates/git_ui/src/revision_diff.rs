@@ -111,7 +111,7 @@ impl RevisionDiffView {
     }
 
     /// Opens pinned local objects without fetching or reading the index/worktree.
-    /// PR callers fetch objects separately, then pass the base/head IDs with MergeBase.
+    /// PR callers supply isolated snapshots through open_snapshot instead.
     pub(crate) fn open(
         workspace: &mut Workspace,
         repository: Entity<Repository>,
@@ -119,6 +119,43 @@ impl RevisionDiffView {
         head: Oid,
         mode: RevisionDiffMode,
         title: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Entity<Self> {
+        Self::open_with(
+            workspace, repository, base, head, mode, title, None, window, cx,
+        )
+    }
+
+    pub(crate) fn open_snapshot(
+        workspace: &mut Workspace,
+        repository: Entity<Repository>,
+        snapshot: RevisionDiff,
+        title: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Entity<Self> {
+        Self::open_with(
+            workspace,
+            repository,
+            snapshot.base,
+            snapshot.head,
+            RevisionDiffMode::MergeBase,
+            title,
+            Some(snapshot),
+            window,
+            cx,
+        )
+    }
+
+    fn open_with(
+        workspace: &mut Workspace,
+        repository: Entity<Repository>,
+        base: Oid,
+        head: Oid,
+        mode: RevisionDiffMode,
+        title: SharedString,
+        snapshot: Option<RevisionDiff>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
@@ -151,12 +188,15 @@ impl RevisionDiffView {
             });
             let load_task = cx.spawn_in(window, async move |this, cx| {
                 let result = async {
-                    let diff = repository
-                        .update(cx, |repository, _| {
-                            repository.load_revision_diff(base, head, mode)
-                        })
-                        .await
-                        .context("Revision diff request was cancelled")??;
+                    let diff = match snapshot {
+                        Some(snapshot) => snapshot,
+                        None => repository
+                            .update(cx, |repository, _| {
+                                repository.load_revision_diff(base, head, mode)
+                            })
+                            .await
+                            .context("Revision diff request was cancelled")??,
+                    };
                     let file_count = diff.files.len();
                     let base = diff.base;
                     let head = diff.head;
@@ -520,7 +560,7 @@ mod tests {
         .into()
     }
 
-    #[gpui::test]
+    #[gpui::test(iterations = 5)]
     async fn test_revision_diff_read_only_buffers_and_load_error(cx: &mut gpui::TestAppContext) {
         use project::{FakeFs, git_store::CommitFile};
         use std::path::Path;
@@ -631,14 +671,24 @@ mod tests {
                 },
             ],
         };
-        view.update_in(&mut cx, |_, window, cx| {
-            let view = cx.weak_entity();
-            window.spawn(cx, async move |cx| {
-                load_files(&view, diff, repository, project, cx).await
-            })
-        })
-        .await
-        .expect("load fixture files");
+        // These pinned IDs do not exist in the backend. Snapshot loading must not reread Git.
+        let view = workspace.update_in(&mut cx, |workspace, window, cx| {
+            RevisionDiffView::open_snapshot(
+                workspace,
+                repository,
+                diff,
+                "PR snapshot".into(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert!(matches!(view.state, LoadState::Loaded { file_count: 3 }));
+            assert_eq!(view.base, base);
+            assert_eq!(view.head, head);
+            assert_eq!(view.mode, RevisionDiffMode::MergeBase);
+        });
         let editor = view.read_with(&cx, |view, cx| view.editor.read(cx).rhs_editor().clone());
         editor.update_in(&mut cx, |editor, window, cx| {
             let multibuffer = editor.buffer().clone();
