@@ -5997,10 +5997,10 @@ async fn request_remote_password(
     response.context("askpass cancelled")
 }
 
-async fn wait_pr_fetch(
-    operation: impl Future<Output = Result<()>>,
+async fn wait_pr_fetch<T>(
+    operation: impl Future<Output = Result<T>>,
     cancel: oneshot::Receiver<()>,
-) -> Result<()> {
+) -> Result<T> {
     let cancel = cancel.fuse();
     let operation = operation.fuse();
     futures::pin_mut!(cancel, operation);
@@ -7330,14 +7330,14 @@ impl Repository {
         head: Oid,
         head_ref: String,
         cx: &mut Context<Self>,
-    ) -> Task<Result<()>> {
+    ) -> Task<Result<RevisionDiff>> {
         let (cancel, cancelled) = oneshot::channel();
         let response = self.send_job("fetch_pr_objects", None, move |git_repo, cx| {
             wait_pr_fetch(
                 async move {
                     match git_repo {
                         RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
-                            backend
+                            let diff = backend
                                 .fetch_objects(
                                     source,
                                     base,
@@ -7346,7 +7346,17 @@ impl Repository {
                                     git::repository::ObjectFetchAuth::GitHubCli,
                                     cx,
                                 )
-                                .await
+                                .await?;
+                            let files = decode_commit_diff(git::repository::CommitDiff {
+                                files: diff.files,
+                                is_shallow_boundary: false,
+                            })
+                            .files;
+                            Ok(RevisionDiff {
+                                base: diff.base,
+                                head: diff.head,
+                                files,
+                            })
                         }
                         RepositoryState::Remote(_) => {
                             bail!("PR diffs are only supported in local repositories")
@@ -12584,7 +12594,7 @@ mod tests {
         let (cancel, cancelled) = oneshot::channel::<()>();
         let held = repository.update(cx, |repository, _| {
             repository.send_job("read-only PR fetch", None, move |_, _| {
-                wait_pr_fetch(future::pending(), cancelled)
+                wait_pr_fetch(future::pending::<Result<()>>(), cancelled)
             })
         });
         let owner = cx.background_executor.spawn(async move {
