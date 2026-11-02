@@ -5963,6 +5963,19 @@ async fn request_remote_password(
     response.context("askpass cancelled")
 }
 
+async fn wait_pr_fetch(
+    operation: impl Future<Output = Result<()>>,
+    cancel: oneshot::Receiver<()>,
+) -> Result<()> {
+    let cancel = cancel.fuse();
+    let operation = operation.fuse();
+    futures::pin_mut!(cancel, operation);
+    futures::select_biased! {
+        _ = cancel => bail!("PR object request cancelled"),
+        result = operation => result,
+    }
+}
+
 impl RepositoryId {
     pub fn to_proto(self) -> u64 {
         self.0
@@ -7212,6 +7225,47 @@ impl Repository {
                     })
                 }
             }
+        })
+    }
+
+    pub fn fetch_pr_objects(
+        &mut self,
+        source: String,
+        base: Oid,
+        head: Oid,
+        head_ref: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let (cancel, cancelled) = oneshot::channel();
+        let response = self.send_job("fetch_pr_objects", None, move |git_repo, cx| {
+            wait_pr_fetch(
+                async move {
+                    match git_repo {
+                        RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                            backend
+                                .fetch_objects(
+                                    source,
+                                    base,
+                                    head,
+                                    head_ref,
+                                    git::repository::ObjectFetchAuth::GitHubCli,
+                                    cx,
+                                )
+                                .await
+                        }
+                        RepositoryState::Remote(_) => {
+                            bail!("PR diffs are only supported in local repositories")
+                        }
+                    }
+                },
+                cancelled,
+            )
+        });
+        // Only this read-only job is cancellable; mutating jobs retain their existing semantics.
+        cx.background_spawn(async move {
+            let result = response.await.context("PR fetch worker stopped")?;
+            drop(cancel);
+            result
         })
     }
 
@@ -12273,6 +12327,56 @@ mod tests {
 
         gate.open();
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_pr_fetch_cancel_queued(_cx: &mut TestAppContext) {
+        let (cancel, cancelled) = oneshot::channel::<()>();
+        drop(cancel);
+        let started = atomic::AtomicBool::new(false);
+        let result = wait_pr_fetch(
+            async {
+                started.store(true, atomic::Ordering::SeqCst);
+                Ok(())
+            },
+            cancelled,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            !started.load(atomic::Ordering::SeqCst),
+            "never start an already-cancelled fetch"
+        );
+    }
+
+    #[gpui::test(iterations = 5)]
+    async fn test_pr_fetch_cancel(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_gate, repository, _) = setup_gated_blob_reads(cx, 1).await;
+        let (cancel, cancelled) = oneshot::channel::<()>();
+        let held = repository.update(cx, |repository, _| {
+            repository.send_job("read-only PR fetch", None, move |_, _| {
+                wait_pr_fetch(future::pending(), cancelled)
+            })
+        });
+        let owner = cx.background_executor.spawn(async move {
+            let _cancel = cancel;
+            held.await.expect("fetch job")
+        });
+        let mut next = repository.update(cx, |repository, _| {
+            repository.send_job("following repository read", None, |_, _| async {})
+        });
+        cx.run_until_parked();
+        assert!(
+            (&mut next).now_or_never().is_none(),
+            "fetch owns the queue while active"
+        );
+        drop(owner);
+        cx.run_until_parked();
+        assert!(
+            matches!((&mut next).now_or_never(), Some(Ok(()))),
+            "cancelling a PR fetch must execute the following job, not merely close its receiver"
+        );
     }
 
     #[gpui::test]

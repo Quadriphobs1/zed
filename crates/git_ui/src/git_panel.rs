@@ -5604,6 +5604,16 @@ impl GitPanel {
         }
         self.reopen_commit_buffer(window, cx);
         self.preload_commit_history(cx);
+        if self.pull_request_browser.is_none()
+            && let Some(repository) = self.active_repository.clone()
+        {
+            self.pull_request_browser = PullRequestBrowser::preload(
+                self.project.clone(),
+                repository,
+                self.workspace.clone(),
+                cx,
+            );
+        }
         if self.active_tab == GitPanelTab::History {
             self.load_commit_history(cx);
         }
@@ -7747,6 +7757,9 @@ impl GitPanel {
                 self._repo_subscriptions.clear();
                 if tab == GitPanelTab::PullRequests {
                     self.ensure_pull_request_browser(cx);
+                    if let Some(browser) = &self.pull_request_browser {
+                        browser.update(cx, |browser, cx| browser.activate(cx));
+                    }
                 }
             }
         }
