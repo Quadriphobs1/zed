@@ -1,4 +1,5 @@
 use anyhow::{Context as _, Result, ensure};
+use db::kvp::KeyValueStore;
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, ScrollStrategy, Task,
     UniformListScrollHandle, WeakEntity, Window, uniform_list,
@@ -13,6 +14,78 @@ use crate::github_pull_requests::{
     GitHubPullRequestService, GitHubRepository, PullRequestDetail, PullRequestFilter,
     PullRequestSummary, RESULT_LIMIT,
 };
+
+const REMOTE_SELECTION_KEY: &str = "pull-request-browser-remote";
+
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct RemoteSelection {
+    name: String,
+    target: String,
+}
+
+#[derive(Default)]
+struct RemoteSelections {
+    entries: collections::HashMap<String, RemoteSelection>,
+    save_task: Option<Task<()>>,
+}
+
+impl gpui::Global for RemoteSelections {}
+
+impl RemoteSelections {
+    fn get(key: &str, cx: &App) -> Option<RemoteSelection> {
+        if let Some(selection) = cx
+            .try_global::<Self>()
+            .and_then(|selections| selections.entries.get(key))
+        {
+            return Some(selection.clone());
+        }
+        KeyValueStore::global(cx)
+            .scoped(REMOTE_SELECTION_KEY)
+            .read(key)
+            .log_err()
+            .flatten()
+            .and_then(|value| serde_json::from_str(&value).log_err())
+    }
+
+    fn save(key: String, selection: RemoteSelection, cx: &mut App) {
+        let selections = cx.default_global::<Self>();
+        let Some(value) = serde_json::to_string(&selection).log_err() else {
+            return;
+        };
+        selections.entries.insert(key.clone(), selection);
+        let previous = selections.save_task.take();
+        let store = KeyValueStore::global(cx);
+        // Share pending choices and write ordering across recreated browsers and windows.
+        let task = cx.background_spawn(async move {
+            if let Some(previous) = previous {
+                previous.await;
+            }
+            store
+                .scoped(REMOTE_SELECTION_KEY)
+                .write(key, value)
+                .await
+                .log_err();
+        });
+        cx.default_global::<Self>().save_task = Some(task);
+    }
+}
+
+impl Drop for RemoteSelections {
+    fn drop(&mut self) {
+        if let Some(task) = self.save_task.take() {
+            task.detach();
+        }
+    }
+}
+
+fn remote_key(path: &std::path::Path) -> String {
+    // Display replaces non-Unicode bytes, which can alias distinct repository paths.
+    path.as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 enum SelectionDirection {
     Next,
@@ -55,6 +128,7 @@ pub(super) struct PullRequestBrowser {
     focus_handle: FocusHandle,
     remotes: Vec<(String, GitHubRepository)>,
     selected_remote: Option<usize>,
+    selection_key: Option<String>,
     filter: PullRequestFilter,
     state: ListState,
     selected_entry: Option<usize>,
@@ -69,6 +143,9 @@ impl PullRequestBrowser {
         workspace: WeakEntity<Workspace>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let selection_key = repository
+            .as_ref()
+            .map(|repository| remote_key(&repository.read(cx).work_directory_abs_path));
         let mut this = Self {
             project,
             repository,
@@ -76,6 +153,7 @@ impl PullRequestBrowser {
             focus_handle: cx.focus_handle(),
             remotes: Vec::new(),
             selected_remote: None,
+            selection_key,
             filter: PullRequestFilter::All,
             state: ListState::default(),
             selected_entry: None,
@@ -104,29 +182,78 @@ impl PullRequestBrowser {
         };
         let response = repository.update(cx, |repository, _| repository.remote_urls());
         self.task = cx.spawn(async move |this, cx| {
-            let result = response.await.context("Git remote request cancelled").and_then(|result| result);
+            let result = response
+                .await
+                .context("Git remote request cancelled")
+                .and_then(|result| result);
             this.update(cx, |this, cx| {
                 if generation != this.state.generation {
                     return;
                 }
                 match result {
                     Ok(remotes) => {
-                        this.remotes = remotes.into_iter().filter_map(|(name, url)| {
-                            let registry = git::GitHostingProviderRegistry::default_global(cx);
-                            Some((name, GitHubRepository::from_remote_url(registry, &url)?))
-                        }).collect();
-                        this.remotes.sort_by(|left, right| left.0.cmp(&right.0));
                         this.state.complete(generation, Ok(Vec::new()));
-                        if this.remotes.is_empty() {
-                            this.state.error = Some("No recognized GitHub remotes. For Enterprise, configure this host as GitHub in git_hosting_providers, then reload remotes. Other providers are not supported.".into());
-                        }
+                        this.set_remotes(remotes, cx);
                     }
                     Err(error) => this.state.complete(generation, Err(error)),
                 }
                 cx.notify();
-            }).log_err();
+            })
+            .log_err();
         });
         cx.notify();
+    }
+
+    fn set_remotes(
+        &mut self,
+        remotes: collections::HashMap<String, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let registry = git::GitHostingProviderRegistry::default_global(cx);
+        self.remotes = remotes
+            .into_iter()
+            .filter_map(|(name, url)| {
+                Some((
+                    name,
+                    GitHubRepository::from_remote_url(registry.clone(), &url)?,
+                ))
+            })
+            .collect();
+        self.remotes.sort_by(|left, right| left.0.cmp(&right.0));
+        self.selected_remote = None;
+        if self.remotes.is_empty() {
+            self.state.error = Some("No recognized GitHub remotes. For Enterprise, configure this host as GitHub in git_hosting_providers, then reload remotes. Other providers are not supported.".into());
+            return;
+        }
+        let last_remote = self
+            .selection_key
+            .as_ref()
+            .and_then(|key| RemoteSelections::get(key, cx));
+        let index = self
+            .remotes
+            .iter()
+            .position(|(name, target)| {
+                last_remote.as_ref().is_some_and(|selection| {
+                    selection.name == *name && selection.target == target.target()
+                })
+            })
+            .unwrap_or(0);
+        self.select_remote(index, cx);
+    }
+
+    fn select_remote(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some((name, target)) = self.remotes.get(index) else {
+            return;
+        };
+        let selection = RemoteSelection {
+            name: name.clone(),
+            target: target.target(),
+        };
+        self.selected_remote = Some(index);
+        if let Some(key) = self.selection_key.clone() {
+            RemoteSelections::save(key, selection, cx);
+        }
+        self.refresh(cx);
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -253,7 +380,7 @@ impl Render for PullRequestBrowser {
                 v_flex()
                     .gap_2()
                     .p_2()
-                    .child(Label::new("GitHub remote (choose explicitly)").size(LabelSize::Small))
+                    .child(Label::new("GitHub remote").size(LabelSize::Small))
                     .children(
                         self.remotes
                             .iter()
@@ -266,8 +393,7 @@ impl Render for PullRequestBrowser {
                                 .toggle_state(self.selected_remote == Some(index))
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
-                                        this.selected_remote = Some(index);
-                                        this.refresh(cx);
+                                        this.select_remote(index, cx);
                                     },
                                 ))
                             }),
@@ -519,6 +645,314 @@ impl Render for PullRequestDescription {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    async fn test_remote_save_retry(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+        let store = cx.update(|cx| KeyValueStore::global(cx));
+        store.write(|connection| {
+            connection.exec("CREATE TRIGGER fail_remote_save BEFORE INSERT ON scoped_kv_store BEGIN SELECT RAISE(FAIL, 'simulated write failure'); END")?()
+        }).await.expect("install write failure");
+        let key = "retry-repository";
+        let selection = RemoteSelection {
+            name: "origin".into(),
+            target: "github.com/example/project".into(),
+        };
+        cx.update(|cx| RemoteSelections::save(key.into(), selection.clone(), cx));
+        let save = cx
+            .update(|cx| cx.default_global::<RemoteSelections>().save_task.take())
+            .expect("pending save");
+        save.await;
+        assert!(
+            store
+                .scoped(REMOTE_SELECTION_KEY)
+                .read(key)
+                .expect("read failed preference")
+                .is_none()
+        );
+        store
+            .write(|connection| connection.exec("DROP TRIGGER fail_remote_save")?())
+            .await
+            .expect("repair database");
+        cx.update(|cx| RemoteSelections::save(key.into(), selection.clone(), cx));
+        let save = cx.update(|cx| cx.default_global::<RemoteSelections>().save_task.take());
+        if let Some(save) = save {
+            save.await;
+        }
+        let value = store
+            .scoped(REMOTE_SELECTION_KEY)
+            .read(key)
+            .expect("read retried preference")
+            .expect("same-choice retry must persist after repair");
+        assert!(
+            serde_json::from_str::<RemoteSelection>(&value).expect("saved selection") == selection
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_remote_path_keys() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let first = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/repo/\x80".to_vec()));
+        let second = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/repo/\x81".to_vec()));
+        assert_ne!(remote_key(&first), remote_key(&second));
+    }
+
+    #[gpui::test]
+    async fn test_remote_defaults(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            git::GitHostingProviderRegistry::default_global(cx);
+            git_hosting_providers::init(cx);
+        });
+        let fs = project::FakeFs::new(cx.background_executor.clone());
+        let project = Project::test(fs, [], cx).await;
+        let browser =
+            cx.new(|cx| PullRequestBrowser::new(project, None, WeakEntity::new_invalid(), cx));
+        browser.update(cx, |browser, cx| {
+            let generation = browser.state.generation;
+            browser.set_remotes(
+                collections::HashMap::from_iter([(
+                    "origin".into(),
+                    "https://github.com/example/fork.git".into(),
+                )]),
+                cx,
+            );
+            assert_eq!(
+                browser.selected_remote,
+                Some(0),
+                "select the only GitHub remote"
+            );
+            assert_eq!(
+                browser.state.generation,
+                generation + 1,
+                "automatic selection must refresh"
+            );
+            browser.set_remotes(
+                collections::HashMap::from_iter([
+                    (
+                        "upstream".into(),
+                        "https://github.com/example/project.git".into(),
+                    ),
+                    (
+                        "origin".into(),
+                        "https://github.com/example/fork.git".into(),
+                    ),
+                    (
+                        "other".into(),
+                        "https://gitlab.com/example/project.git".into(),
+                    ),
+                ]),
+                cx,
+            );
+            assert_eq!(browser.remotes.len(), 2);
+            assert_eq!(browser.selected_remote, Some(0));
+            assert_eq!(
+                browser.remotes[0].0, "origin",
+                "default to the first sorted GitHub remote"
+            );
+        });
+    }
+
+    #[gpui::test(iterations = 5)]
+    async fn test_remote_memory(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            cx.set_global(db::AppDatabase::test_new());
+            git::GitHostingProviderRegistry::default_global(cx);
+            git_hosting_providers::init(cx);
+        });
+        let fs = project::FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            util::path!("/"),
+            serde_json::json!({
+                "first": { ".git": {} }, "second": { ".git": {} }
+            }),
+        )
+        .await;
+        let project = Project::test(
+            fs,
+            [
+                std::path::Path::new(util::path!("/first")),
+                std::path::Path::new(util::path!("/second")),
+            ],
+            cx,
+        )
+        .await;
+        cx.run_until_parked();
+        let mut repositories = project.read_with(cx, |project, cx| {
+            project
+                .repositories(cx)
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+        repositories.sort_by_key(|repository| {
+            repository.read_with(cx, |repository, _| {
+                repository.work_directory_abs_path.clone()
+            })
+        });
+        let first = repositories.first().expect("first repository").clone();
+        let second = repositories.get(1).expect("second repository").clone();
+        let remotes = collections::HashMap::from_iter([
+            (
+                "upstream".into(),
+                "https://github.com/example/project.git".into(),
+            ),
+            (
+                "origin".into(),
+                "https://github.com/example/fork.git".into(),
+            ),
+        ]);
+        let browser = cx.new(|cx| {
+            PullRequestBrowser::new(
+                project.clone(),
+                Some(first.clone()),
+                WeakEntity::new_invalid(),
+                cx,
+            )
+        });
+        browser.update(cx, |browser, cx| {
+            browser.set_remotes(remotes.clone(), cx);
+            assert_eq!(browser.selected_remote, Some(0));
+            let generation = browser.state.generation;
+            browser.select_remote(1, cx);
+            assert_eq!(
+                browser.state.generation,
+                generation + 1,
+                "explicit selection must refresh"
+            );
+            browser.select_remote(0, cx);
+            browser.select_remote(1, cx);
+            browser.set_remotes(remotes.clone(), cx);
+            assert_eq!(
+                browser.selected_remote,
+                Some(1),
+                "reload must retain an unsaved selection"
+            );
+            assert!(
+                browser.state.generation > generation,
+                "selection must refresh the list"
+            );
+            assert!(
+                browser
+                    .state
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("trust")),
+                "automatic refresh must retain the trust gate without invoking gh"
+            );
+        });
+        // Recreate before yielding: none of the queued saves can have completed.
+        drop(browser);
+
+        let restored = cx.new(|cx| {
+            PullRequestBrowser::new(
+                project.clone(),
+                Some(first.clone()),
+                WeakEntity::new_invalid(),
+                cx,
+            )
+        });
+        restored.update(cx, |browser, cx| {
+            browser.set_remotes(remotes.clone(), cx);
+            assert_eq!(
+                browser.selected_remote,
+                Some(1),
+                "pending choice must survive browser recreation"
+            );
+        });
+        let other = cx.new(|cx| {
+            PullRequestBrowser::new(project.clone(), Some(second), WeakEntity::new_invalid(), cx)
+        });
+        other.update(cx, |browser, cx| {
+            browser.set_remotes(remotes.clone(), cx);
+            assert_eq!(
+                browser.selected_remote,
+                Some(0),
+                "selection must not leak between repositories"
+            );
+        });
+        let save = cx.update(|cx| cx.default_global::<RemoteSelections>().save_task.take());
+        if let Some(save) = save {
+            save.await;
+        }
+        drop(restored);
+        drop(other);
+        cx.update(|cx| cx.set_global(RemoteSelections::default()));
+
+        let restored = cx
+            .new(|cx| PullRequestBrowser::new(project, Some(first), WeakEntity::new_invalid(), cx));
+        restored.update(cx, |browser, cx| {
+            browser.set_remotes(remotes.clone(), cx);
+            assert_eq!(
+                browser.selected_remote,
+                Some(1),
+                "restore persisted selection without the memory cache"
+            );
+            let mut changed = remotes.clone();
+            changed.insert(
+                "upstream".into(),
+                "https://github.com/example/replacement.git".into(),
+            );
+            browser.set_remotes(changed, cx);
+            assert_eq!(
+                browser.selected_remote,
+                Some(0),
+                "retargeted remote must fall back"
+            );
+            browser.select_remote(1, cx);
+            browser.set_remotes(
+                collections::HashMap::from_iter([(
+                    "origin".into(),
+                    "https://github.com/example/fork.git".into(),
+                )]),
+                cx,
+            );
+            assert_eq!(
+                browser.selected_remote,
+                Some(0),
+                "removed remote must fall back"
+            );
+            browser.set_remotes(collections::HashMap::default(), cx);
+            assert_eq!(browser.selected_remote, None);
+            assert!(
+                browser
+                    .state
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("No recognized GitHub remotes"))
+            );
+        });
+        let save = cx.update(|cx| cx.default_global::<RemoteSelections>().save_task.take());
+        if let Some(save) = save {
+            save.await;
+        }
+        let key = restored.read_with(cx, |browser, _| {
+            browser.selection_key.clone().expect("repository key")
+        });
+        let store = cx.update(|cx| KeyValueStore::global(cx));
+        store
+            .scoped(REMOTE_SELECTION_KEY)
+            .write(key, "invalid JSON".into())
+            .await
+            .expect("write corrupt preference");
+        cx.update(|cx| cx.set_global(RemoteSelections::default()));
+        restored.update(cx, |browser, cx| {
+            browser.set_remotes(remotes, cx);
+            assert_eq!(
+                browser.selected_remote,
+                Some(0),
+                "corrupt preferences must fall back"
+            );
+        });
+        let save = cx.update(|cx| cx.default_global::<RemoteSelections>().save_task.take());
+        if let Some(save) = save {
+            save.await;
+        }
+    }
 
     #[gpui::test]
     async fn test_pr_row_click_target(cx: &mut gpui::TestAppContext) {
