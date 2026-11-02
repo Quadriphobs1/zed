@@ -233,7 +233,7 @@ pub struct CommitDiff {
 /// An immutable comparison, decoded for native diff editors.
 #[derive(Debug)]
 pub struct RevisionDiff {
-    /// The effective old-side commit (the merge base in merge-base mode).
+    /// The effective old-side object: merge base, first parent, or root's empty tree.
     pub base: Oid,
     pub head: Oid,
     /// Binary files retain side presence but have empty text, matching commit diffs.
@@ -7274,6 +7274,49 @@ impl Repository {
         // Only this read-only job is cancellable; mutating jobs retain their existing semantics.
         cx.background_spawn(async move {
             let result = response.await.context("PR fetch worker stopped")?;
+            drop(cancel);
+            result
+        })
+    }
+
+    pub fn fetch_pr_commit(
+        &mut self,
+        source: String,
+        commit: Oid,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<RevisionDiff>> {
+        let (cancel, cancelled) = oneshot::channel();
+        let response = self.send_job("fetch_pr_commit", None, move |git_repo, cx| {
+            wait_pr_fetch(
+                async move {
+                    let RepositoryState::Local(LocalRepositoryState { backend, .. }) = git_repo
+                    else {
+                        bail!("Commit previews are only supported in local repositories");
+                    };
+                    let diff = backend
+                        .fetch_commit(
+                            source,
+                            commit,
+                            git::repository::ObjectFetchAuth::GitHubCli,
+                            cx,
+                        )
+                        .await?;
+                    let files = decode_commit_diff(git::repository::CommitDiff {
+                        files: diff.files,
+                        is_shallow_boundary: false,
+                    })
+                    .files;
+                    Ok(RevisionDiff {
+                        base: diff.base,
+                        head: diff.head,
+                        files,
+                    })
+                },
+                cancelled,
+            )
+        });
+        cx.background_spawn(async move {
+            let result = response.await.context("Commit preview worker stopped")?;
             drop(cancel);
             result
         })

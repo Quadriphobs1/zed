@@ -49,6 +49,7 @@ const OBJECT_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
 const OBJECT_FETCH_ERROR_LIMIT: usize = 4096;
 const PR_ANCESTRY_DEPTHS: [usize; 3] = [32, 128, 512];
 const PR_BLOB_BATCH_SIZE: usize = 128;
+const COMMIT_SNAPSHOT_DEPTH: usize = 2;
 const PR_REPOSITORY_ENV: &[&str] = &[
     "GIT_DIR",
     "GIT_COMMON_DIR",
@@ -576,7 +577,7 @@ pub enum ObjectFetchAuth {
 
 #[derive(Debug)]
 pub struct RevisionDiff {
-    /// The effective old-side commit, which may be a merge base rather than the input base.
+    /// The effective old-side object: merge base, first parent, or empty tree for a root commit.
     pub base: Oid,
     pub head: Oid,
     /// Complete object contents. Renames are represented as a deletion and an addition.
@@ -1079,6 +1080,17 @@ pub trait GitRepository: Send + Sync {
         _cx: AsyncApp,
     ) -> BoxFuture<'_, Result<RevisionDiff>> {
         async { bail!("PR snapshots are not supported by this repository backend") }.boxed()
+    }
+
+    /// Load a pinned commit against its actual first parent, or the empty tree for a root.
+    fn fetch_commit(
+        &self,
+        _source: String,
+        _commit: Oid,
+        _auth: ObjectFetchAuth,
+        _cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<RevisionDiff>> {
+        async { bail!("Commit snapshots are not supported by this repository backend") }.boxed()
     }
 
     /// Returns the absolute path to the repository. For worktrees, this will be the path to the
@@ -3141,6 +3153,54 @@ impl GitRepository for RealGitRepository {
         }).boxed()
     }
 
+    fn fetch_commit(
+        &self,
+        source: String,
+        commit: Oid,
+        auth: ObjectFetchAuth,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<RevisionDiff>> {
+        let git = self.git_binary().for_snapshot();
+        let executor = cx.background_executor().clone();
+        cx.background_spawn(async move {
+            let request = async {
+                anyhow::ensure!(
+                    git.is_trusted,
+                    "Trust this repository before preparing commit changes"
+                );
+                if let Ok(base) = git.commit_base(commit).await {
+                    if let Ok(snapshot) = git.read_snapshot(base, commit).await {
+                        return Ok(snapshot);
+                    }
+                }
+                git.check_snapshot_url(&source, auth).await?;
+                let (_directory, isolated) = git.new_snapshot_store().await?;
+                isolated
+                    .fetch_snapshot(
+                        &source,
+                        auth,
+                        &[&commit.to_string()],
+                        Some(COMMIT_SNAPSHOT_DEPTH),
+                    )
+                    .await
+                    .context("The pinned commit is unavailable; refresh activity or open GitHub")?;
+                let base = isolated.commit_base(commit).await?;
+                isolated
+                    .fetch_snapshot_blobs(&source, auth, base, commit)
+                    .await?;
+                isolated.read_snapshot(base, commit).await
+            }
+            .fuse();
+            let timeout = executor.timer(OBJECT_FETCH_TIMEOUT).fuse();
+            futures::pin_mut!(request, timeout);
+            select_biased! {
+                result = request => result,
+                () = timeout => bail!("Preparing commit changes timed out; retry or open GitHub"),
+            }
+        })
+        .boxed()
+    }
+
     fn get_push_remote(&self, branch: String) -> BoxFuture<'_, Result<Option<Remote>>> {
         let git = self.git_binary();
         self.executor
@@ -3985,6 +4045,31 @@ impl GitBinary {
         self.build_command_with_config(&[], args)
     }
 
+    async fn new_snapshot_store(&self) -> Result<(tempfile::TempDir, Self)> {
+        let directory = tempfile::tempdir().context("Creating isolated snapshot storage")?;
+        let isolated = GitBinary::new(
+            self.git_binary_path.clone(),
+            directory.path().into(),
+            directory.path().into(),
+            self.executor.clone(),
+            true,
+        )
+        .for_snapshot()
+        .envs(self.envs.clone());
+        let format = self
+            .run_snapshot(&["rev-parse", "--show-object-format"])
+            .await?;
+        isolated
+            .run_snapshot(&[
+                "init",
+                "--bare",
+                "--template=",
+                &format!("--object-format={format}"),
+            ])
+            .await?;
+        Ok((directory, isolated))
+    }
+
     async fn fetch_pr_snapshot(
         &self,
         source: &str,
@@ -4009,27 +4094,7 @@ impl GitBinary {
 
         // Keep shallow metadata and partial objects out of the user's object database.
         // Return file contents, not commit IDs that require another local history walk.
-        let directory = tempfile::tempdir().context("Creating isolated PR history")?;
-        let isolated = GitBinary::new(
-            self.git_binary_path.clone(),
-            directory.path().into(),
-            directory.path().into(),
-            self.executor.clone(),
-            true,
-        )
-        .for_snapshot()
-        .envs(self.envs.clone());
-        let format = self
-            .run_snapshot(&["rev-parse", "--show-object-format"])
-            .await?;
-        isolated
-            .run_snapshot(&[
-                "init",
-                "--bare",
-                "--template=",
-                &format!("--object-format={format}"),
-            ])
-            .await?;
+        let (_directory, isolated) = self.new_snapshot_store().await?;
         let base_ref = base.to_string();
         for depth in depths {
             log::info!("Preparing PR snapshot at ancestry depth {depth}");
@@ -4055,7 +4120,12 @@ impl GitBinary {
     }
 
     async fn run_snapshot(&self, args: &[&str]) -> Result<String> {
-        let output = self.build_command(args).kill_on_drop(true).output().await?;
+        let output = self
+            .build_command(args)
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await?;
         anyhow::ensure!(
             output.status.success(),
             "PR snapshot Git command failed: {}",
@@ -4148,6 +4218,36 @@ impl GitBinary {
             "--",
         ])
         .await
+    }
+
+    async fn commit_base(&self, commit: Oid) -> Result<Oid> {
+        let revision = commit.to_string();
+        anyhow::ensure!(
+            self.run_snapshot(&["cat-file", "-t", &revision]).await? == "commit",
+            "Expected a pinned commit object"
+        );
+        let output = self
+            .build_command(&["cat-file", "commit", &revision])
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await?;
+        anyhow::ensure!(output.status.success(), "Cannot read the pinned commit");
+        // Raw headers retain real parents at shallow boundaries; formatted history can hide them.
+        let parent = output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .take_while(|line| !line.is_empty())
+            .find_map(|line| line.strip_prefix(b"parent "));
+        if let Some(parent) = parent {
+            return Oid::from_str(std::str::from_utf8(parent)?)
+                .context("Invalid first-parent revision");
+        }
+        // hash-object without -w computes the empty tree without changing checkout objects.
+        self.run_snapshot(&["hash-object", "-t", "tree", "--stdin"])
+            .await?
+            .parse()
+            .context("Invalid empty-tree revision")
     }
 
     async fn read_snapshot(&self, base: Oid, head: Oid) -> Result<RevisionDiff> {
@@ -4857,6 +4957,225 @@ mod tests {
         assert_eq!(
             fs::canonicalize(left.as_ref()).unwrap(),
             fs::canonicalize(right.as_ref()).unwrap()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_pr_commit_snapshot(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().expect("fixture");
+        let (remote, clone) = clone_remote_repository_with_main_and_feature(directory.path());
+        let seed = directory.path().join("seed");
+        let root: Oid = git_command_output(&clone, ["rev-parse", "HEAD"])
+            .parse()
+            .expect("root");
+        let parent: Oid = git_command_output(&seed, ["rev-parse", "HEAD"])
+            .parse()
+            .expect("parent");
+        fs::write(seed.join("feature.txt"), "middle").expect("middle content");
+        git_command(&seed, ["commit", "-am", "middle"]);
+        let commit: Oid = git_command_output(&seed, ["rev-parse", "HEAD"])
+            .parse()
+            .expect("middle");
+        fs::write(seed.join("feature.txt"), "later").expect("later content");
+        git_command(&seed, ["commit", "-am", "later"]);
+        git_command(&seed, ["push", "origin", "HEAD:refs/pull/42/head"]);
+        fs::write(clone.join("file.txt"), "staged").expect("staged");
+        git_command(&clone, ["add", "file.txt"]);
+        fs::write(clone.join("file.txt"), "dirty").expect("dirty");
+        fs::write(clone.join(".git/FETCH_HEAD"), "sentinel\n").expect("fetch sentinel");
+        let metadata = ["HEAD", "config", "index", "FETCH_HEAD"];
+        let before: Vec<_> = metadata
+            .iter()
+            .map(|name| fs::read(clone.join(".git").join(name)).expect("metadata"))
+            .collect();
+        let objects = git_command_output(&clone, ["count-objects", "-v"]);
+        let refs = git_command_output(&clone, ["show-ref"]);
+        let repository =
+            RealGitRepository::new(&clone.join(".git"), None, Some("git".into()), cx.executor())
+                .expect("repository");
+        repository.set_trusted(true);
+        let snapshot = repository
+            .fetch_commit(
+                remote.to_string_lossy().into_owned(),
+                commit,
+                ObjectFetchAuth::Configured,
+                cx.to_async(),
+            )
+            .await
+            .expect("non-tip commit snapshot");
+        assert_eq!(snapshot.base, parent);
+        assert_eq!(snapshot.head, commit);
+        assert_eq!(snapshot.files.len(), 1);
+        assert_eq!(
+            snapshot.files[0].old_content.as_deref(),
+            Some(b"feature".as_slice())
+        );
+        assert_eq!(
+            snapshot.files[0].new_content.as_deref(),
+            Some(b"middle".as_slice())
+        );
+        let root_snapshot = repository
+            .fetch_commit(
+                "/missing-remote".into(),
+                root,
+                ObjectFetchAuth::Configured,
+                cx.to_async(),
+            )
+            .await
+            .expect("local root snapshot");
+        assert_eq!(root_snapshot.files.len(), 1);
+        assert_eq!(root_snapshot.files[0].old_content, None);
+        assert_eq!(
+            root_snapshot.files[0].new_content.as_deref(),
+            Some(b"main".as_slice())
+        );
+        let first_parent: Oid = git_command_output(&seed, ["rev-parse", "HEAD"])
+            .parse()
+            .expect("merge first parent");
+        git_command(&seed, ["switch", "-c", "activity-side", &root.to_string()]);
+        fs::write(seed.join("side.txt"), "side change").expect("side content");
+        git_command(&seed, ["add", "side.txt"]);
+        git_command(&seed, ["commit", "-m", "side"]);
+        git_command(&seed, ["switch", "feature"]);
+        git_command(&seed, ["merge", "--no-ff", "activity-side", "-m", "merge"]);
+        let merge: Oid = git_command_output(&seed, ["rev-parse", "HEAD"])
+            .parse()
+            .expect("merge commit");
+        git_command(&seed, ["push", "origin", "HEAD:refs/pull/42/head"]);
+        let snapshot = repository
+            .fetch_commit(
+                remote.to_string_lossy().into_owned(),
+                merge,
+                ObjectFetchAuth::Configured,
+                cx.to_async(),
+            )
+            .await
+            .expect("merge snapshot");
+        assert_eq!(snapshot.base, first_parent);
+        assert_eq!(
+            snapshot.files.len(),
+            1,
+            "merge compares only against its first parent"
+        );
+        assert_eq!(
+            snapshot.files[0].new_content.as_deref(),
+            Some(b"side change".as_slice())
+        );
+
+        let shallow = directory.path().join("shallow");
+        let source = url::Url::from_file_path(&remote)
+            .expect("file URL")
+            .to_string();
+        git_command(
+            directory.path(),
+            [
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                "feature",
+                &source,
+                shallow.to_str().expect("fixture path"),
+            ],
+        );
+        fs::write(shallow.join(".git/FETCH_HEAD"), "shallow sentinel").expect("sentinel");
+        let shallow_metadata = ["HEAD", "config", "index", "FETCH_HEAD", "shallow"];
+        let shallow_before: Vec<_> = shallow_metadata
+            .iter()
+            .map(|name| fs::read(shallow.join(".git").join(name)).expect("shallow metadata"))
+            .collect();
+        let shallow_objects = git_command_output(&shallow, ["count-objects", "-v"]);
+        let shallow_refs = git_command_output(&shallow, ["show-ref"]);
+        let shallow_repository = RealGitRepository::new(
+            &shallow.join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .expect("shallow repository");
+        shallow_repository.set_trusted(true);
+        let snapshot = shallow_repository
+            .fetch_commit(
+                source.clone(),
+                parent,
+                ObjectFetchAuth::Configured,
+                cx.to_async(),
+            )
+            .await
+            .expect("commit at shallow boundary");
+        assert_eq!(
+            snapshot.base, root,
+            "a shallow boundary is not a root commit"
+        );
+        assert_eq!(
+            snapshot.files.len(),
+            1,
+            "root's other files must not appear"
+        );
+        let snapshot = shallow_repository
+            .fetch_commit(
+                source.clone(),
+                commit,
+                ObjectFetchAuth::Configured,
+                cx.to_async(),
+            )
+            .await
+            .expect("unseen non-tip commit in shallow checkout");
+        assert_eq!(snapshot.base, parent);
+        assert_eq!(
+            snapshot.files[0].new_content.as_deref(),
+            Some(b"middle".as_slice())
+        );
+        let snapshot = shallow_repository
+            .fetch_commit(source, root, ObjectFetchAuth::Configured, cx.to_async())
+            .await
+            .expect("isolated root commit");
+        assert_eq!(snapshot.files.len(), 1);
+        assert_eq!(snapshot.files[0].old_content, None);
+        assert_eq!(
+            snapshot.files[0].new_content.as_deref(),
+            Some(b"main".as_slice())
+        );
+        for (name, bytes) in shallow_metadata.iter().zip(shallow_before) {
+            assert_eq!(
+                fs::read(shallow.join(".git").join(name)).expect("unchanged shallow metadata"),
+                bytes,
+                "changed {name}"
+            );
+        }
+        assert_eq!(
+            git_command_output(&shallow, ["count-objects", "-v"]),
+            shallow_objects
+        );
+        assert_eq!(git_command_output(&shallow, ["show-ref"]), shallow_refs);
+        assert!(git_command_output(&shallow, ["status", "--porcelain"]).is_empty());
+
+        for (name, bytes) in metadata.iter().zip(before) {
+            assert_eq!(
+                fs::read(clone.join(".git").join(name)).expect("unchanged metadata"),
+                bytes,
+                "changed {name}"
+            );
+        }
+        assert_eq!(git_command_output(&clone, ["count-objects", "-v"]), objects);
+        assert_eq!(git_command_output(&clone, ["show-ref"]), refs);
+        assert_eq!(
+            fs::read_to_string(clone.join("file.txt")).expect("worktree"),
+            "dirty"
+        );
+        repository.set_trusted(false);
+        assert!(
+            repository
+                .fetch_commit(
+                    remote.to_string_lossy().into_owned(),
+                    commit,
+                    ObjectFetchAuth::Configured,
+                    cx.to_async()
+                )
+                .await
+                .is_err()
         );
     }
 

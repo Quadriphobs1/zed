@@ -131,6 +131,7 @@ impl RevisionDiffView {
         workspace: &mut Workspace,
         repository: Entity<Repository>,
         snapshot: RevisionDiff,
+        mode: RevisionDiffMode,
         title: SharedString,
         window: &mut Window,
         cx: &mut Context<Workspace>,
@@ -140,7 +141,7 @@ impl RevisionDiffView {
             repository,
             snapshot.base,
             snapshot.head,
-            RevisionDiffMode::MergeBase,
+            mode,
             title,
             Some(snapshot),
             window,
@@ -456,6 +457,7 @@ impl Render for RevisionDiffView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let base = self.base.to_string();
         let head = self.head.to_string();
+        let mode = self.mode;
         let base_label = match self.mode {
             RevisionDiffMode::Direct => "Base",
             RevisionDiffMode::MergeBase => match self.state {
@@ -504,11 +506,12 @@ impl Render for RevisionDiffView {
                             .color(Color::Muted),
                     )
                     .child(
-                        Button::new("base-sha", format!("{base_label}: {base}"))
-                            .tooltip(Tooltip::text("Copy base SHA"))
-                            .on_click(move |_, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(base.clone()));
-                            }),
+                        div().debug_selector(move || match mode { RevisionDiffMode::Direct => "revision-base-direct".into(), RevisionDiffMode::MergeBase => "revision-base-merge".into() }).child(
+                            Button::new("base-sha", format!("{base_label}: {base}"))
+                                .tooltip(Tooltip::text("Copy base SHA"))
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(base.clone()));
+                                })),
                     )
                     .child(
                         Button::new("head-sha", format!("Head: {head}"))
@@ -677,6 +680,7 @@ mod tests {
                 workspace,
                 repository,
                 diff,
+                RevisionDiffMode::MergeBase,
                 "PR snapshot".into(),
                 window,
                 cx,

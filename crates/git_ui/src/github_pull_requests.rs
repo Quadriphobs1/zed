@@ -5,6 +5,9 @@ use std::{str::FromStr as _, sync::Arc};
 use util::command::{Stdio, new_command};
 
 pub(super) const RESULT_LIMIT: usize = 100;
+const GH_RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
+const GH_STDERR_LIMIT: usize = 64 * 1024;
+const GH_ERROR_LIMIT: usize = 4096;
 const LIST_FIELDS: &str = "number,title,author,isDraft";
 const DETAIL_FIELDS: &str =
     "number,title,author,isDraft,body,state,baseRefName,headRefName,baseRefOid,headRefOid";
@@ -136,10 +139,76 @@ pub(super) struct PullRequestDetail {
     pub(super) head_ref_oid: String,
 }
 
+pub(super) const ACTIVITY_PAGE_SIZE: usize = 20;
+pub(super) const ACTIVITY_LIMIT: usize = 200;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ActivitySection {
+    Timeline,
+    Threads,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ActivityComment {
+    pub(super) author: String,
+    pub(super) date: String,
+    pub(super) body: String,
+    pub(super) hunk: String,
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum ActivityKind {
+    Commit {
+        oid: Oid,
+        title: String,
+    },
+    Comment,
+    Review {
+        state: String,
+    },
+    Thread {
+        path: String,
+        line: Option<u64>,
+        resolved: bool,
+        outdated: bool,
+        comments: Vec<ActivityComment>,
+        more_comments: bool,
+    },
+    Event {
+        name: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ActivityItem {
+    pub(super) id: String,
+    pub(super) author: String,
+    pub(super) date: String,
+    pub(super) body: String,
+    pub(super) kind: ActivityKind,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ActivityPage {
+    pub(super) head: String,
+    pub(super) items: Vec<ActivityItem>,
+    pub(super) cursor: Option<String>,
+}
+
 /// Uses gh's existing authentication without logging in, fetching Git objects, or writing to GitHub.
 pub(super) struct GitHubPullRequestService;
 
 impl GitHubPullRequestService {
+    pub(super) async fn activity(
+        repository: &GitHubRepository,
+        number: u64,
+        section: ActivitySection,
+        cursor: Option<String>,
+    ) -> Result<ActivityPage> {
+        let arguments = activity_arguments(repository, number, section, cursor);
+        parse_activity(&run_gh(repository, arguments).await?, number, section)
+    }
+
     pub(super) async fn list(
         repository: &GitHubRepository,
         filter: PullRequestFilter,
@@ -203,7 +272,7 @@ fn detail_arguments(repository: &GitHubRepository, number: u64) -> Vec<String> {
 }
 
 async fn run_gh(repository: &GitHubRepository, arguments: Vec<String>) -> Result<Vec<u8>> {
-    let output = new_command("gh")
+    let mut child = new_command("gh")
         .args(arguments)
         // An explicit repository and a neutral cwd prevent local repository configuration from choosing the target.
         .current_dir(std::env::temp_dir())
@@ -213,20 +282,46 @@ async fn run_gh(repository: &GitHubRepository, arguments: Vec<String>) -> Result
         .env("GH_NO_EXTENSION_UPDATE_NOTIFIER", "1")
         .env("GH_PAGER", "cat")
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .output()
-        .await
+        .spawn()
         .with_context(|| format!("Could not run GitHub CLI (gh). Install gh and authenticate with gh auth login --hostname {} outside Zed, then refresh", repository.host))?;
+    let stdout = child.stdout.take().context("Missing GitHub CLI output")?;
+    let stderr = child.stderr.take().context("Missing GitHub CLI errors")?;
+    // Stop oversized responses before parsing or retaining nested review content.
+    let (stdout, stderr, status) = futures::try_join!(
+        read_gh_output(stdout, GH_RESPONSE_LIMIT),
+        read_gh_output(stderr, GH_STDERR_LIMIT),
+        async { anyhow::Ok(child.status().await?) },
+    )?;
     ensure!(
-        output.status.success(),
+        status.success(),
         "GitHub CLI failed ({}): {}. Check gh auth status, repository access, and GitHub rate limits, then refresh. Zed does not start interactive login",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
+        status,
+        String::from_utf8_lossy(&stderr)
             .chars()
-            .take(4096)
+            .take(GH_ERROR_LIMIT)
             .collect::<String>()
     );
-    Ok(output.stdout)
+    Ok(stdout)
+}
+
+async fn read_gh_output(
+    reader: impl futures::io::AsyncRead + Unpin,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    use futures::AsyncReadExt as _;
+    let mut bytes = Vec::new();
+    reader
+        .take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .await?;
+    ensure!(
+        bytes.len() <= limit,
+        "GitHub response exceeded the size limit; open GitHub for this activity"
+    );
+    Ok(bytes)
 }
 
 fn parse_list(bytes: &[u8]) -> Result<Vec<PullRequestSummary>> {
@@ -258,6 +353,231 @@ fn parse_detail(bytes: &[u8], number: u64) -> Result<PullRequestDetail> {
         Oid::from_str(sha).context("Invalid GitHub commit SHA")?;
     }
     Ok(detail)
+}
+
+fn activity_arguments(
+    repository: &GitHubRepository,
+    number: u64,
+    section: ActivitySection,
+    cursor: Option<String>,
+) -> Vec<String> {
+    let query = match section {
+        ActivitySection::Timeline => {
+            r#"query($owner:String!,$name:String!,$number:Int!,$limit:Int!,$cursor:String) {
+            repository(owner:$owner,name:$name) { pullRequest(number:$number) {
+                number headRefOid timelineItems(first:$limit,after:$cursor) {
+                    pageInfo { hasNextPage endCursor } edges { cursor node { __typename
+                        ... on PullRequestCommit { commit { oid messageHeadline messageBody committedDate author { name user { login } } } }
+                        ... on IssueComment { body createdAt author { login } }
+                        ... on PullRequestReview { body submittedAt state author { login } }
+                    } }
+                }
+            } }
+        }"#
+        }
+        ActivitySection::Threads => {
+            r#"query($owner:String!,$name:String!,$number:Int!,$limit:Int!,$cursor:String) {
+            repository(owner:$owner,name:$name) { pullRequest(number:$number) {
+                number headRefOid reviewThreads(first:$limit,after:$cursor) {
+                    pageInfo { hasNextPage endCursor } edges { cursor node {
+                        path line isResolved isOutdated comments(first:$limit) {
+                            pageInfo { hasNextPage } nodes { body createdAt author { login } diffHunk }
+                        }
+                    } }
+                }
+            } }
+        }"#
+        }
+    };
+    let mut arguments = vec![
+        "api".into(),
+        "graphql".into(),
+        "--hostname".into(),
+        repository.host.clone(),
+        "--method".into(),
+        "POST".into(),
+        "-f".into(),
+        format!("query={query}"),
+        "-f".into(),
+        format!("owner={}", repository.owner),
+        "-f".into(),
+        format!("name={}", repository.name),
+        "-F".into(),
+        format!("number={number}"),
+        "-F".into(),
+        format!("limit={ACTIVITY_PAGE_SIZE}"),
+    ];
+    if let Some(cursor) = cursor {
+        arguments.extend(["-f".into(), format!("cursor={cursor}")]);
+    }
+    arguments
+}
+
+fn json_string<'a>(value: &'a serde_json::Value, key: &str) -> Result<&'a str> {
+    value[key]
+        .as_str()
+        .with_context(|| format!("Missing GitHub activity {key}"))
+}
+
+fn activity_oid(value: &str) -> Result<Oid> {
+    ensure!(
+        value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Invalid GitHub activity commit ID"
+    );
+    Oid::from_str(value).context("Invalid GitHub activity commit ID")
+}
+
+fn activity_actor(value: &serde_json::Value) -> String {
+    value["author"]["login"]
+        .as_str()
+        .unwrap_or("ghost")
+        .to_owned()
+}
+
+fn parse_activity(bytes: &[u8], number: u64, section: ActivitySection) -> Result<ActivityPage> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).context("Invalid GitHub activity response")?;
+    // GraphQL can return HTTP success and partial data alongside authorization or schema errors.
+    ensure!(
+        value
+            .get("errors")
+            .is_none_or(|errors| errors.as_array().is_some_and(Vec::is_empty)),
+        "GitHub returned activity errors; check access/rate limits and retry, or open GitHub"
+    );
+    let pr = &value["data"]["repository"]["pullRequest"];
+    ensure!(
+        number > 0 && pr["number"].as_u64() == Some(number),
+        "GitHub returned a different pull request"
+    );
+    let head = activity_oid(json_string(pr, "headRefOid")?)?.to_string();
+    let connection = &pr[match section {
+        ActivitySection::Timeline => "timelineItems",
+        ActivitySection::Threads => "reviewThreads",
+    }];
+    let edges = connection["edges"]
+        .as_array()
+        .context("Missing GitHub activity page")?;
+    ensure!(
+        edges.len() <= ACTIVITY_PAGE_SIZE,
+        "GitHub activity page exceeded the limit"
+    );
+    let has_more = connection["pageInfo"]["hasNextPage"]
+        .as_bool()
+        .context("Missing GitHub activity pagination")?;
+    let cursor = if has_more {
+        let cursor = json_string(&connection["pageInfo"], "endCursor")?;
+        ensure!(
+            !cursor.is_empty() && !edges.is_empty(),
+            "Invalid GitHub activity cursor"
+        );
+        Some(cursor.to_owned())
+    } else {
+        None
+    };
+    let mut items = Vec::with_capacity(edges.len());
+    for edge in edges {
+        let id = json_string(edge, "cursor")?.to_owned();
+        ensure!(
+            !id.is_empty() && !items.iter().any(|item: &ActivityItem| item.id == id),
+            "Duplicate or missing GitHub activity cursor"
+        );
+        let node = &edge["node"];
+        let mut item = ActivityItem {
+            id,
+            author: String::new(),
+            date: String::new(),
+            body: String::new(),
+            kind: ActivityKind::Event {
+                name: "Unavailable event".into(),
+            },
+        };
+        if node.is_null() {
+            items.push(item);
+            continue;
+        }
+        if section == ActivitySection::Threads {
+            let comments = node["comments"]["nodes"]
+                .as_array()
+                .context("Missing GitHub thread comments")?;
+            ensure!(
+                comments.len() <= ACTIVITY_PAGE_SIZE,
+                "GitHub review thread exceeded the comment limit"
+            );
+            let comments = comments
+                .iter()
+                .map(|comment| {
+                    Ok(ActivityComment {
+                        author: activity_actor(comment),
+                        date: json_string(comment, "createdAt")?.into(),
+                        body: json_string(comment, "body")?.into(),
+                        hunk: json_string(comment, "diffHunk")?.into(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let line = if node["line"].is_null() {
+                None
+            } else {
+                Some(
+                    node["line"]
+                        .as_u64()
+                        .context("Invalid GitHub review line")?,
+                )
+            };
+            item.kind = ActivityKind::Thread {
+                path: json_string(node, "path")?.into(),
+                line,
+                resolved: node["isResolved"]
+                    .as_bool()
+                    .context("Missing thread resolution")?,
+                outdated: node["isOutdated"]
+                    .as_bool()
+                    .context("Missing thread status")?,
+                comments,
+                more_comments: node["comments"]["pageInfo"]["hasNextPage"]
+                    .as_bool()
+                    .context("Missing thread pagination")?,
+            };
+            items.push(item);
+            continue;
+        }
+        item.kind = match json_string(node, "__typename")? {
+            "PullRequestCommit" => {
+                let commit = &node["commit"];
+                item.author = commit["author"]["user"]["login"]
+                    .as_str()
+                    .or_else(|| commit["author"]["name"].as_str())
+                    .unwrap_or("ghost")
+                    .into();
+                item.date = json_string(commit, "committedDate")?.into();
+                item.body = json_string(commit, "messageBody")?.into();
+                ActivityKind::Commit {
+                    oid: activity_oid(json_string(commit, "oid")?)?,
+                    title: json_string(commit, "messageHeadline")?.into(),
+                }
+            }
+            "IssueComment" => {
+                item.author = activity_actor(node);
+                item.date = json_string(node, "createdAt")?.into();
+                item.body = json_string(node, "body")?.into();
+                ActivityKind::Comment
+            }
+            "PullRequestReview" => {
+                item.author = activity_actor(node);
+                item.date = node["submittedAt"].as_str().unwrap_or_default().into();
+                item.body = json_string(node, "body")?.into();
+                ActivityKind::Review {
+                    state: json_string(node, "state")?.into(),
+                }
+            }
+            name => ActivityKind::Event { name: name.into() },
+        };
+        items.push(item);
+    }
+    Ok(ActivityPage {
+        head,
+        items,
+        cursor,
+    })
 }
 
 #[cfg(test)]
@@ -394,6 +714,150 @@ mod tests {
         assert_eq!(
             repository.pull_request_url(42),
             "https://github.com/owner/repo/pull/42"
+        );
+    }
+
+    fn activity_response(section: ActivitySection, nodes: serde_json::Value) -> serde_json::Value {
+        let connection = match section {
+            ActivitySection::Timeline => "timelineItems",
+            ActivitySection::Threads => "reviewThreads",
+        };
+        let mut pr = serde_json::json!({"number":42,"headRefOid":"1111111111111111111111111111111111111111"});
+        pr[connection] = serde_json::json!({"edges": nodes, "pageInfo":{"hasNextPage":true,"endCursor":"next-page"}});
+        serde_json::json!({"data":{"repository":{"pullRequest":pr}}})
+    }
+
+    #[test]
+    fn test_pr_activity_output() {
+        futures::executor::block_on(async {
+            assert_eq!(
+                read_gh_output(futures::io::Cursor::new(b"body"), 4)
+                    .await
+                    .expect("bounded output"),
+                b"body"
+            );
+            assert!(
+                read_gh_output(futures::io::Cursor::new(b"large"), 4)
+                    .await
+                    .is_err()
+            );
+        });
+        let repository =
+            parse_remote("git@github.enterprise.test:team/project.git").expect("target");
+        for section in [ActivitySection::Timeline, ActivitySection::Threads] {
+            let arguments =
+                activity_arguments(&repository, 42, section, Some("opaque{cursor}".into()));
+            assert_eq!(
+                &arguments[..6],
+                [
+                    "api",
+                    "graphql",
+                    "--hostname",
+                    "github.enterprise.test",
+                    "--method",
+                    "POST"
+                ]
+            );
+            assert!(arguments.iter().any(|arg| arg == "number=42"));
+            assert!(arguments.iter().any(|arg| arg == "limit=20"));
+            assert!(arguments.iter().any(|arg| arg == "cursor=opaque{cursor}"));
+            assert!(!arguments.iter().any(|arg| arg == "--paginate"));
+            assert!(arguments.iter().any(|arg| arg.starts_with("query=query(")));
+        }
+    }
+
+    #[test]
+    fn test_pr_activity_pages() {
+        let value = activity_response(
+            ActivitySection::Timeline,
+            serde_json::json!([
+                {"cursor":"commit-cursor","node":{"__typename":"PullRequestCommit","commit":{
+                    "oid":"2222222222222222222222222222222222222222","messageHeadline":"Change","messageBody":"Details",
+                    "committedDate":"2026-01-01T00:00:00Z","author":{"name":"Contributor","user":null}}}},
+                {"cursor":"comment-cursor","node":{"__typename":"IssueComment","id":"comment-id","author":null,"createdAt":"2026-01-02T00:00:00Z","body":"**Comment**"}},
+                {"cursor":"review-cursor","node":{"__typename":"PullRequestReview","id":"review-id","author":{"login":"reviewer"},"submittedAt":null,"state":"APPROVED","body":"Looks fine"}},
+                {"cursor":"event-cursor","node":{"__typename":"MergedEvent"}}
+            ]),
+        );
+        let bytes = serde_json::to_vec(&value).expect("JSON");
+        let page = parse_activity(&bytes, 42, ActivitySection::Timeline).expect("activity page");
+        assert_eq!(page.cursor.as_deref(), Some("next-page"));
+        assert_eq!(page.items.len(), 4);
+        assert!(
+            matches!(&page.items[0].kind, ActivityKind::Commit{oid,..} if oid.to_string() == "2222222222222222222222222222222222222222")
+        );
+        assert_eq!(page.items[0].author, "Contributor");
+        assert_eq!(page.items[1].author, "ghost");
+        assert_eq!(page.items[1].body, "**Comment**");
+        assert!(matches!(&page.items[2].kind, ActivityKind::Review{state} if state == "APPROVED"));
+        assert!(matches!(&page.items[3].kind, ActivityKind::Event{name} if name == "MergedEvent"));
+        assert!(parse_activity(&bytes, 43, ActivitySection::Timeline).is_err());
+        let mut invalid = value.clone();
+        invalid["errors"] = serde_json::json!([{"message":"partial response"}]);
+        assert!(
+            parse_activity(
+                &serde_json::to_vec(&invalid).expect("JSON"),
+                42,
+                ActivitySection::Timeline
+            )
+            .is_err()
+        );
+        invalid = value.clone();
+        invalid["data"]["repository"]["pullRequest"]["timelineItems"]["pageInfo"]["endCursor"] =
+            serde_json::Value::Null;
+        assert!(
+            parse_activity(
+                &serde_json::to_vec(&invalid).expect("JSON"),
+                42,
+                ActivitySection::Timeline
+            )
+            .is_err()
+        );
+        invalid = value;
+        invalid["data"]["repository"]["pullRequest"]["timelineItems"]["edges"][0]["node"]["commit"]
+            ["oid"] = "main".into();
+        assert!(
+            parse_activity(
+                &serde_json::to_vec(&invalid).expect("JSON"),
+                42,
+                ActivitySection::Timeline
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_pr_activity_threads() {
+        let value = activity_response(
+            ActivitySection::Threads,
+            serde_json::json!([
+                {"cursor":"thread-cursor","node":{"id":"thread-id","path":"src/example.rs","line":12,"isResolved":true,"isOutdated":true,
+                    "comments":{"nodes":[{"author":{"login":"reviewer"},"createdAt":"2026-01-01T00:00:00Z","body":"Comment","diffHunk":"@@ -1 +1 @@\n-old\n+new"}],"pageInfo":{"hasNextPage":true}}}}
+            ]),
+        );
+        let page = parse_activity(
+            &serde_json::to_vec(&value).expect("JSON"),
+            42,
+            ActivitySection::Threads,
+        )
+        .expect("threads page");
+        assert!(
+            matches!(&page.items[0].kind, ActivityKind::Thread{path,line:Some(12),resolved:true,outdated:true,comments,more_comments:true} if path == "src/example.rs" && comments.len()==1 && comments[0].body=="Comment")
+        );
+        let oversized = activity_response(
+            ActivitySection::Timeline,
+            serde_json::json!(vec![
+                serde_json::json!({"cursor":"x","node":{"__typename":"MergedEvent"}});
+                ACTIVITY_PAGE_SIZE + 1
+            ]),
+        );
+        assert!(
+            parse_activity(
+                &serde_json::to_vec(&oversized).expect("JSON"),
+                42,
+                ActivitySection::Timeline
+            )
+            .is_err()
         );
     }
 
