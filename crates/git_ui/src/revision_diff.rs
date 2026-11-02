@@ -454,7 +454,7 @@ impl Render for RevisionDiffView {
                     .border_color(cx.theme().colors().border_variant)
                     .child(Label::new(self.title.clone()))
                     .child(
-                        Label::new("Read-only local snapshot • No fetch performed; remote-tracking refs may be stale.")
+                        Label::new("Read-only revision snapshot • No checkout or staging; local edits are excluded.")
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     )

@@ -1,21 +1,28 @@
 use anyhow::{Context as _, Result, ensure};
 use db::kvp::KeyValueStore;
+use git::{Oid, repository::RevisionDiffMode};
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, ScrollStrategy, Task,
     UniformListScrollHandle, WeakEntity, Window, uniform_list,
 };
-use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
+use markdown::{
+    CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont,
+    MarkdownStyle, WrapButtonVisibility,
+};
 use project::{Project, git_store::Repository, trusted_worktrees::TrustedWorktrees};
+use std::str::FromStr as _;
 use ui::prelude::*;
 use util::ResultExt as _;
 use workspace::{Item, Workspace};
 
 use crate::github_pull_requests::{
-    GitHubPullRequestService, GitHubRepository, PullRequestDetail, PullRequestFilter,
-    PullRequestSummary, RESULT_LIMIT,
+    GitHubRepository, PullRequestDetail, PullRequestFilter, PullRequestSummary, RESULT_LIMIT,
 };
+use crate::pull_request_cache::{CachePolicy, PullRequestCache};
+use crate::revision_diff::RevisionDiffView;
 
 const REMOTE_SELECTION_KEY: &str = "pull-request-browser-remote";
+const DESCRIPTION_WIDTH_REMS: f32 = 60.0;
 
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct RemoteSelection {
@@ -116,7 +123,10 @@ impl ListState {
         self.loading = false;
         match result {
             Ok(entries) => self.entries = entries,
-            Err(error) => self.error = Some(format!("{error:#}")),
+            Err(error) => {
+                self.entries.clear();
+                self.error = Some(format!("{error:#}"));
+            }
         }
     }
 }
@@ -137,6 +147,18 @@ pub(super) struct PullRequestBrowser {
 }
 
 impl PullRequestBrowser {
+    pub(super) fn preload(
+        project: Entity<Project>,
+        repository: Entity<Repository>,
+        workspace: WeakEntity<Workspace>,
+        cx: &mut App,
+    ) -> Option<Entity<Self>> {
+        if check_access(&project, cx).is_err() {
+            return None;
+        }
+        Some(cx.new(|cx| Self::new(project, Some(repository), workspace, cx)))
+    }
+
     pub(super) fn new(
         project: Entity<Project>,
         repository: Option<Entity<Repository>>,
@@ -162,6 +184,12 @@ impl PullRequestBrowser {
         };
         this.load_remotes(cx);
         this
+    }
+
+    pub(super) fn activate(&mut self, cx: &mut Context<Self>) {
+        if self.selected_remote.is_some() {
+            self.load_list(CachePolicy::PreferCache, cx);
+        }
     }
 
     fn load_remotes(&mut self, cx: &mut Context<Self>) {
@@ -253,10 +281,14 @@ impl PullRequestBrowser {
         if let Some(key) = self.selection_key.clone() {
             RemoteSelections::save(key, selection, cx);
         }
-        self.refresh(cx);
+        self.load_list(CachePolicy::PreferCache, cx);
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.load_list(CachePolicy::Reload, cx);
+    }
+
+    fn load_list(&mut self, policy: CachePolicy, cx: &mut Context<Self>) {
         self.task = Task::ready(());
         self.selected_entry = None;
         self.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
@@ -275,16 +307,39 @@ impl PullRequestBrowser {
                 return;
             }
         };
-        let filter = self.filter;
+        let scope = self.selection_key.as_deref().unwrap_or_default();
+        let (snapshot, response) = PullRequestCache::list(scope, target, self.filter, policy, cx);
+        if let Some(snapshot) = snapshot {
+            self.state.entries = snapshot;
+        }
         self.task = cx.spawn(async move |this, cx| {
-            let result = GitHubPullRequestService::list(&target, filter).await;
+            let result = response
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()));
             this.update(cx, |this, cx| {
-                this.state.complete(generation, result);
+                this.apply_list(generation, result);
                 cx.notify();
             })
             .log_err();
         });
         cx.notify();
+    }
+
+    fn apply_list(&mut self, generation: usize, result: Result<Vec<PullRequestSummary>>) {
+        if generation != self.state.generation {
+            return;
+        }
+        let selected = self
+            .selected_entry
+            .and_then(|index| self.state.entries.get(index))
+            .map(|entry| entry.number);
+        self.state.complete(generation, result);
+        self.selected_entry = selected.and_then(|number| {
+            self.state
+                .entries
+                .iter()
+                .position(|entry| entry.number == number)
+        });
     }
 
     fn open_entry(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -302,7 +357,18 @@ impl PullRequestBrowser {
         let project = self.project.clone();
         self.workspace
             .update(cx, |workspace, cx| {
-                let detail = cx.new(|cx| PullRequestDescription::new(project, target, number, cx));
+                let repository = self.repository.clone();
+                let workspace_handle = cx.weak_entity();
+                let detail = cx.new(|cx| {
+                    PullRequestDescription::new(
+                        project,
+                        repository,
+                        workspace_handle,
+                        target,
+                        number,
+                        cx,
+                    )
+                });
                 workspace.add_item_to_active_pane(Box::new(detail), None, true, window, cx);
             })
             .log_err();
@@ -408,7 +474,7 @@ impl Render for PullRequestBrowser {
                                         .disabled(self.selected_remote.is_none())
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.filter = filter;
-                                            this.refresh(cx);
+                                            this.load_list(CachePolicy::PreferCache, cx);
                                         }))
                                 },
                             ),
@@ -435,7 +501,11 @@ impl Render for PullRequestBrowser {
                         .color(Color::Muted),
                     )
                     .when(self.state.loading, |this| {
-                        this.child(Label::new("Loading…"))
+                        this.child(Label::new(if self.state.entries.is_empty() {
+                            "Loading…"
+                        } else {
+                            "Updating…"
+                        }))
                     })
                     .when_some(self.state.error.clone(), |this, error| {
                         this.child(Label::new(error).color(Color::Error))
@@ -533,6 +603,9 @@ impl Render for PullRequestBrowser {
 
 struct PullRequestDescription {
     project: Entity<Project>,
+    repository: Option<Entity<Repository>>,
+    workspace: WeakEntity<Workspace>,
+    scope: String,
     target: GitHubRepository,
     number: u64,
     focus_handle: FocusHandle,
@@ -541,17 +614,29 @@ struct PullRequestDescription {
     error: Option<String>,
     loading: bool,
     task: Task<()>,
+    diff_loading: bool,
+    diff_error: Option<String>,
+    diff_task: Task<()>,
 }
 
 impl PullRequestDescription {
     fn new(
         project: Entity<Project>,
+        repository: Option<Entity<Repository>>,
+        workspace: WeakEntity<Workspace>,
         target: GitHubRepository,
         number: u64,
         cx: &mut Context<Self>,
     ) -> Self {
+        let scope = repository
+            .as_ref()
+            .map(|repository| remote_key(&repository.read(cx).work_directory_abs_path))
+            .unwrap_or_default();
         let mut this = Self {
             project,
+            repository,
+            workspace,
+            scope,
             target,
             number,
             focus_handle: cx.focus_handle(),
@@ -560,12 +645,94 @@ impl PullRequestDescription {
             error: None,
             loading: false,
             task: Task::ready(()),
+            diff_loading: false,
+            diff_error: None,
+            diff_task: Task::ready(()),
         };
-        this.refresh(cx);
+        this.load_detail(CachePolicy::PreferCache, cx);
         this
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.load_detail(CachePolicy::Reload, cx);
+    }
+
+    fn set_detail(&mut self, detail: PullRequestDetail, cx: &mut Context<Self>) {
+        let body = if detail.body.is_empty() {
+            "No description provided.".into()
+        } else {
+            detail.body.clone()
+        };
+        let languages = self.project.read(cx).languages().clone();
+        self.markdown = Some(cx.new(|cx| Markdown::new(body.into(), Some(languages), None, cx)));
+        self.detail = Some(detail);
+    }
+
+    fn open_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let result = (|| {
+            check_access(&self.project, cx)?;
+            let detail = self
+                .detail
+                .as_ref()
+                .context("Load the PR description before previewing changes")?;
+            let repository = self
+                .repository
+                .clone()
+                .context("The PR repository is no longer available")?;
+            let base = Oid::from_str(&detail.base_ref_oid).context("Invalid PR base revision")?;
+            let head = Oid::from_str(&detail.head_ref_oid).context("Invalid PR head revision")?;
+            anyhow::Ok((repository, base, head))
+        })();
+        let (repository, base, head) = match result {
+            Ok(revisions) => revisions,
+            Err(error) => {
+                self.diff_error = Some(format!("{error:#}"));
+                cx.notify();
+                return;
+            }
+        };
+        self.diff_error = None;
+        self.diff_loading = true;
+        let source = format!("https://{}.git", self.target.target());
+        let head_ref = format!("refs/pull/{}/head", self.number);
+        let response = repository.update(cx, |repository, cx| {
+            repository.fetch_pr_objects(source, base, head, head_ref, cx)
+        });
+        let title: SharedString = format!("{} #{} changes", self.target.slug(), self.number).into();
+        self.diff_task = cx.spawn_in(window, async move |this, cx| {
+            let result = response.await;
+            this.update_in(cx, |this, window, cx| {
+                this.diff_loading = false;
+                let result = result
+                    .and_then(|()| check_access(&this.project, cx))
+                    .and_then(|()| {
+                        this.workspace.update(cx, |workspace, cx| {
+                            RevisionDiffView::open(
+                                workspace,
+                                repository,
+                                base,
+                                head,
+                                RevisionDiffMode::MergeBase,
+                                title,
+                                window,
+                                cx,
+                            );
+                        })
+                    });
+                if let Err(error) = result {
+                    this.diff_error = Some(format!("{error:#}"));
+                }
+                cx.notify();
+            })
+            .log_err();
+        });
+        cx.notify();
+    }
+
+    fn load_detail(&mut self, policy: CachePolicy, cx: &mut Context<Self>) {
+        self.diff_task = Task::ready(());
+        self.diff_loading = false;
+        self.diff_error = None;
         self.task = Task::ready(());
         self.detail = None;
         self.markdown = None;
@@ -577,24 +744,24 @@ impl PullRequestDescription {
             return;
         }
         self.loading = true;
-        let target = self.target.clone();
-        let number = self.number;
+        let (snapshot, response) =
+            PullRequestCache::detail(&self.scope, self.target.clone(), self.number, policy, cx);
+        if let Some(snapshot) = snapshot {
+            self.set_detail(snapshot, cx);
+        }
         self.task = cx.spawn(async move |this, cx| {
-            let result = GitHubPullRequestService::detail(&target, number).await;
+            let result = response
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()));
             this.update(cx, |this, cx| {
                 this.loading = false;
                 match result {
-                    Ok(detail) => {
-                        let body = if detail.body.is_empty() {
-                            "No description provided.".into()
-                        } else {
-                            detail.body.clone()
-                        };
-                        this.markdown =
-                            Some(cx.new(|cx| Markdown::new(body.into(), None, None, cx)));
-                        this.detail = Some(detail);
+                    Ok(detail) => this.set_detail(detail, cx),
+                    Err(error) => {
+                        this.detail = None;
+                        this.markdown = None;
+                        this.error = Some(format!("{error:#}"));
                     }
-                    Err(error) => this.error = Some(format!("{error:#}")),
                 }
                 cx.notify();
             })
@@ -620,25 +787,39 @@ impl Render for PullRequestDescription {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let url = self.target.pull_request_url(self.number);
         let diff_url = format!("{url}/files");
-        v_flex().id("pr-description").size_full().overflow_y_scroll().p_4().gap_2()
+        v_flex().id("pr-description").size_full().overflow_y_scroll().p_6()
+            .child(v_flex().w_full().max_w(rems(DESCRIPTION_WIDTH_REMS)).mx_auto().gap_3()
             .track_focus(&self.focus_handle)
             .bg(cx.theme().colors().editor_background)
             .child(Label::new(format!("{} #{}", self.target.slug(), self.number)))
             .child(h_flex().flex_wrap().gap_2()
                 .child(Button::new("pr-detail-refresh", "Refresh description").on_click(cx.listener(|this, _, _, cx| this.refresh(cx))))
                 .child(Button::new("pr-browser", "Open on GitHub").on_click(move |_, _, cx| cx.open_url(&url)))
-                .child(Button::new("pr-diff-browser", "Open Diff on GitHub").on_click(move |_, _, cx| cx.open_url(&diff_url))))
-            .child(Label::new("Native PR diffs are not available yet. Open Diff on GitHub shows the current published changes, not local edits.").color(Color::Muted))
+                .child(Button::new("pr-diff-browser", "Open Diff on GitHub").on_click(move |_, _, cx| cx.open_url(&diff_url)))
+                .child(Button::new("pr-diff-native", "Preview changes in Zed")
+                    .disabled(self.detail.is_none() || self.diff_loading)
+                    .on_click(cx.listener(|this, _, window, cx| this.open_diff(window, cx)))))
+            .child(Label::new("Preview changes fetches missing Git objects on request. It never checks out a branch or changes your staged or unstaged edits.").size(LabelSize::Small).color(Color::Muted))
+            .when(self.diff_loading, |this| this.child(Label::new("Preparing PR changes…")))
+            .when_some(self.diff_error.clone(), |this, error| this.child(Label::new(error).color(Color::Error)))
             .when(self.loading, |this| this.child(Label::new("Loading pull request…")))
             .when_some(self.error.clone(), |this, error| this.child(Label::new(error).color(Color::Error)))
             .when_some(self.detail.as_ref(), |this, detail| this
-                .child(Label::new(detail.summary.title.clone()))
+                .child(Label::new(detail.summary.title.clone()).size(LabelSize::Large))
                 .child(Label::new(format!("By {} • {}{}", detail.summary.author_login(), detail.state, if detail.summary.is_draft { " • Draft" } else { "" })))
                 .child(Label::new(format!("{} ← {}", detail.base_ref_name, detail.head_ref_name)))
                 .child(Label::new(format!("Base: {}", detail.base_ref_oid)).size(LabelSize::Small))
                 .child(Label::new(format!("Head: {}", detail.head_ref_oid)).size(LabelSize::Small))
                 .child(Label::new("Metadata snapshot; refresh after a force-push. Browser links always show the latest GitHub state.").size(LabelSize::Small).color(Color::Muted)))
-            .when_some(self.markdown.clone(), |this, markdown| this.child(MarkdownElement::new(markdown, MarkdownStyle::themed(MarkdownFont::Editor, window, cx))))
+            .when_some(self.markdown.clone(), |this, markdown| {
+                this.child(div().w_full().pt_3().border_t_1().border_color(cx.theme().colors().border)
+                    .child(MarkdownElement::new(markdown, MarkdownStyle::themed(MarkdownFont::Preview, window, cx))
+                        .code_block_renderer(CodeBlockRenderer::Default {
+                            copy_button_visibility: CopyButtonVisibility::VisibleOnHover,
+                            wrap_button_visibility: WrapButtonVisibility::VisibleOnHover,
+                            border: true,
+                        })))
+            }))
     }
 }
 
@@ -796,6 +977,19 @@ mod tests {
         });
         let first = repositories.first().expect("first repository").clone();
         let second = repositories.get(1).expect("second repository").clone();
+        cx.update(|cx| {
+            assert!(
+                PullRequestBrowser::preload(
+                    project.clone(),
+                    first.clone(),
+                    WeakEntity::new_invalid(),
+                    cx
+                )
+                .is_none(),
+                "never prefetch untrusted repositories"
+            );
+            assert!(cx.try_global::<PullRequestCache>().is_none());
+        });
         let remotes = collections::HashMap::from_iter([
             (
                 "upstream".into(),
@@ -952,6 +1146,114 @@ mod tests {
         if let Some(save) = save {
             save.await;
         }
+    }
+
+    #[gpui::test]
+    async fn test_pr_cached_selection(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+        });
+        let fs = project::FakeFs::new(cx.background_executor.clone());
+        let project = Project::test(fs, [], cx).await;
+        let browser =
+            cx.new(|cx| PullRequestBrowser::new(project, None, WeakEntity::new_invalid(), cx));
+        let entries: Vec<PullRequestSummary> = serde_json::from_value(serde_json::json!([
+            {"number": 1, "title": "First", "author": null, "isDraft": false},
+            {"number": 2, "title": "Second", "author": null, "isDraft": false},
+            {"number": 3, "title": "Third", "author": null, "isDraft": false},
+            {"number": 4, "title": "Fourth", "author": null, "isDraft": false},
+            {"number": 5, "title": "Selected", "author": null, "isDraft": false}
+        ]))
+        .expect("cached list fixture");
+        let generation = browser.update(cx, |browser, _| {
+            let generation = browser.state.begin();
+            browser.state.entries = entries.clone();
+            generation
+        });
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        let response = cx
+            .background_executor
+            .spawn(async move { receiver.await.expect("delayed list") });
+        browser.update(cx, |browser, _| browser.selected_entry = Some(4));
+        sender
+            .send(vec![entries[4].clone(), entries[0].clone()])
+            .expect("finish revalidation");
+        let entries = response.await;
+        browser.update(cx, |browser, _| {
+            browser.apply_list(generation, Ok(entries.clone()));
+            assert_eq!(
+                browser.selected_entry,
+                Some(0),
+                "retain selection by PR number, not row index"
+            );
+            browser.apply_list(generation - 1, Ok(Vec::new()));
+            assert_eq!(
+                browser.selected_entry,
+                Some(0),
+                "ignore an obsolete response"
+            );
+            browser.apply_list(generation, Ok(vec![entries[1].clone()]));
+            assert_eq!(browser.selected_entry, None, "clear a removed selection");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_pr_markdown(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            git::GitHostingProviderRegistry::default_global(cx);
+            git_hosting_providers::init(cx);
+        });
+        let fs = project::FakeFs::new(cx.background_executor.clone());
+        let project = Project::test(fs, [], cx).await;
+        project.read_with(cx, |project, cx| {
+            project
+                .languages()
+                .register_test_language(language::LanguageConfig {
+                    name: "Demo".into(),
+                    ..Default::default()
+                });
+            assert!(cx.try_global::<PullRequestCache>().is_none());
+        });
+        let target = cx.update(|cx| {
+            GitHubRepository::from_remote_url(
+                git::GitHostingProviderRegistry::default_global(cx),
+                "https://github.com/example/project.git",
+            )
+            .expect("GitHub target")
+        });
+        let description = cx.new(|cx| {
+            PullRequestDescription::new(project, None, WeakEntity::new_invalid(), target, 1, cx)
+        });
+        let body = "# Preview\n\n**Description** with [a link](https://example.com).\n\n```demo\nlet value = 1;\n```\n\n| File | Change |\n| --- | --- |\n| a | added |\n";
+        description.update(cx, |description, cx| {
+            let detail = serde_json::from_value(serde_json::json!({
+                "number": 1, "title": "Preview fixture", "author": {"login": "author"}, "isDraft": false,
+                "body": body, "state": "OPEN", "baseRefName": "main", "headRefName": "feature",
+                "baseRefOid": "1".repeat(40), "headRefOid": "2".repeat(40)
+            })).expect("description fixture");
+            description.set_detail(detail, cx);
+        });
+        cx.run_until_parked();
+        description.read_with(cx, |description, cx| {
+            let markdown = description
+                .markdown
+                .as_ref()
+                .expect("Markdown preview")
+                .read(cx);
+            assert_eq!(markdown.source().as_ref(), body);
+            assert_eq!(
+                markdown
+                    .first_code_block_language()
+                    .expect("use project languages for code blocks")
+                    .name()
+                    .as_ref(),
+                "Demo"
+            );
+        });
     }
 
     #[gpui::test]

@@ -123,7 +123,7 @@ impl PullRequestSummary {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct PullRequestDetail {
     #[serde(flatten)]
