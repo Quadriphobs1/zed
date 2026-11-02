@@ -701,32 +701,48 @@ impl PullRequestDescription {
         let title: SharedString = format!("{} #{} changes", self.target.slug(), self.number).into();
         self.diff_task = cx.spawn_in(window, async move |this, cx| {
             let result = response.await;
-            this.update_in(cx, |this, window, cx| {
-                this.diff_loading = false;
-                let result = result
-                    .and_then(|()| check_access(&this.project, cx))
-                    .and_then(|()| {
-                        this.workspace.update(cx, |workspace, cx| {
-                            RevisionDiffView::open(
-                                workspace,
-                                repository,
-                                base,
-                                head,
-                                RevisionDiffMode::MergeBase,
-                                title,
-                                window,
-                                cx,
-                            );
-                        })
-                    });
-                if let Err(error) = result {
-                    this.diff_error = Some(format!("{error:#}"));
-                }
-                cx.notify();
+            cx.update(|window, cx| {
+                Self::finish_diff(&this, result, (repository, base, head), title, window, cx);
             })
             .log_err();
         });
         cx.notify();
+    }
+
+    fn finish_diff(
+        this: &WeakEntity<Self>,
+        result: Result<()>,
+        (repository, base, head): (Entity<Repository>, Oid, Oid),
+        title: SharedString,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let result = (|| {
+            result?;
+            let (project, workspace) =
+                this.read_with(cx, |this, _| (this.project.clone(), this.workspace.clone()))?;
+            check_access(&project, cx)?;
+
+            // Adding a pane item reads existing items; do not hold the description's lease.
+            workspace.update(cx, |workspace, cx| {
+                RevisionDiffView::open(
+                    workspace,
+                    repository,
+                    base,
+                    head,
+                    RevisionDiffMode::MergeBase,
+                    title,
+                    window,
+                    cx,
+                );
+            })
+        })();
+        this.update(cx, |this, cx| {
+            this.diff_loading = false;
+            this.diff_error = result.err().map(|error| format!("{error:#}"));
+            cx.notify();
+        })
+        .log_err();
     }
 
     fn load_detail(&mut self, policy: CachePolicy, cx: &mut Context<Self>) {
@@ -1254,6 +1270,137 @@ mod tests {
                 "Demo"
             );
         });
+    }
+
+    #[gpui::test(iterations = 5)]
+    async fn test_pr_preview_completion(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            git::GitHostingProviderRegistry::default_global(cx);
+            git_hosting_providers::init(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            language_model::init(cx);
+            editor::init(cx);
+            crate::init(cx);
+        });
+        let fs = project::FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(util::path!("/repo"), serde_json::json!({".git": {}}))
+            .await;
+        let project = Project::test(fs, [std::path::Path::new(util::path!("/repo"))], cx).await;
+        cx.run_until_parked();
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .repositories(cx)
+                .values()
+                .next()
+                .expect("repository")
+                .clone()
+        });
+        let window = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = window
+            .read_with(cx, |root, _| root.workspace().clone())
+            .expect("workspace");
+        let target = cx.update(|cx| {
+            GitHubRepository::from_remote_url(
+                git::GitHostingProviderRegistry::default_global(cx),
+                "https://github.com/example/project.git",
+            )
+            .expect("target")
+        });
+        let description = cx.new(|cx| {
+            PullRequestDescription::new(
+                project.clone(),
+                Some(repository.clone()),
+                workspace.downgrade(),
+                target,
+                1,
+                cx,
+            )
+        });
+        window
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.add_item_to_active_pane(
+                        Box::new(description.clone()),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    );
+                });
+                project::trusted_worktrees::init(Default::default(), cx);
+                let complete = |result, window: &mut Window, cx: &mut App| {
+                    description.update(cx, |description, _| description.diff_loading = true);
+                    PullRequestDescription::finish_diff(
+                        &description.downgrade(),
+                        result,
+                        (
+                            repository.clone(),
+                            Oid::from_str(&"1".repeat(40)).expect("base"),
+                            Oid::from_str(&"2".repeat(40)).expect("head"),
+                        ),
+                        "PR changes".into(),
+                        window,
+                        cx,
+                    );
+                };
+                complete(Ok(()), window, cx);
+                assert!(!description.read(cx).diff_loading);
+                assert!(description.read(cx).diff_error.is_some());
+                assert!(
+                    workspace
+                        .read(cx)
+                        .active_item_as::<PullRequestDescription>(cx)
+                        .is_some()
+                );
+
+                let store = project.read(cx).worktree_store();
+                let paths = project
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .map(|tree| project::trusted_worktrees::PathTrust::Worktree(tree.read(cx).id()))
+                    .collect();
+                TrustedWorktrees::try_get_global(cx)
+                    .expect("trust store")
+                    .update(cx, |trusted, cx| {
+                        trusted.trust(&store, paths, cx);
+                    });
+                check_access(&project, cx).expect("trusted fixture");
+                const FETCH_ERROR: &str = "fixture fetch failure";
+                complete(Err(anyhow::anyhow!(FETCH_ERROR)), window, cx);
+                assert!(!description.read(cx).diff_loading);
+                assert_eq!(
+                    description.read(cx).diff_error.as_deref(),
+                    Some(FETCH_ERROR)
+                );
+                assert!(
+                    workspace
+                        .read(cx)
+                        .active_item_as::<PullRequestDescription>(cx)
+                        .is_some()
+                );
+
+                complete(Ok(()), window, cx);
+                assert!(
+                    workspace
+                        .read(cx)
+                        .active_item_as::<RevisionDiffView>(cx)
+                        .is_some()
+                );
+                assert_eq!(
+                    workspace
+                        .read(cx)
+                        .items_of_type::<PullRequestDescription>(cx)
+                        .count(),
+                    1
+                );
+                assert!(!description.read(cx).diff_loading);
+                assert!(description.read(cx).diff_error.is_none());
+            })
+            .expect("preview completion");
     }
 
     #[gpui::test]
