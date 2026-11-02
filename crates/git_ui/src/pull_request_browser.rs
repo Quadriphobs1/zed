@@ -2,16 +2,21 @@ use anyhow::{Context as _, Result, ensure};
 use db::kvp::KeyValueStore;
 use git::{Oid, repository::RevisionDiffMode};
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, ScrollStrategy, Task,
-    UniformListScrollHandle, WeakEntity, Window, uniform_list,
+    App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, ScrollHandle,
+    ScrollStrategy, Task, UniformListScrollHandle, WeakEntity, Window, uniform_list,
 };
 use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont,
     MarkdownStyle, WrapButtonVisibility,
 };
 use project::{Project, git_store::Repository, trusted_worktrees::TrustedWorktrees};
+use settings::Settings;
 use std::str::FromStr as _;
-use ui::prelude::*;
+use theme_settings::ThemeSettings;
+use ui::{
+    Chip, ContextMenu, PopoverMenu, TintColor, Tooltip, WithScrollbar, prelude::*,
+    right_click_menu, utils::WithRemSize,
+};
 use util::ResultExt as _;
 use workspace::{Item, Workspace};
 
@@ -23,6 +28,8 @@ use crate::revision_diff::RevisionDiffView;
 
 const REMOTE_SELECTION_KEY: &str = "pull-request-browser-remote";
 const DESCRIPTION_WIDTH_REMS: f32 = 60.0;
+const REFRESH_PR_LABEL: &str = "Refresh pull request";
+const PR_FETCH_NOTICE: &str = "Fetches missing Git objects on request. Never checks out a branch or changes staged or unstaged edits.";
 
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct RemoteSelection {
@@ -617,6 +624,8 @@ struct PullRequestDescription {
     diff_loading: bool,
     diff_error: Option<String>,
     diff_task: Task<()>,
+    details_expanded: bool,
+    scroll_handle: ScrollHandle,
 }
 
 impl PullRequestDescription {
@@ -648,6 +657,8 @@ impl PullRequestDescription {
             diff_loading: false,
             diff_error: None,
             diff_task: Task::ready(()),
+            details_expanded: false,
+            scroll_handle: ScrollHandle::new(),
         };
         this.load_detail(CachePolicy::PreferCache, cx);
         this
@@ -799,49 +810,564 @@ impl Item for PullRequestDescription {
         format!("{} #{}", self.target.slug(), self.number).into()
     }
 }
+impl PullRequestDescription {
+    fn render_header(&self, cx: &Context<Self>) -> AnyElement {
+        let url = self.target.pull_request_url(self.number);
+        v_flex()
+            .debug_selector(|| "pr-header".into())
+            .flex_none()
+            .w_full()
+            .min_w_0()
+            .p_4()
+            .gap_2()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_2()
+                    .child(
+                        Label::new(format!("{} #{}", self.target.slug(), self.number))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate()
+                            .flex_1(),
+                    )
+                    .when_some(self.detail.as_ref(), |this, detail| {
+                        let (label, color) = match (detail.state.as_str(), detail.summary.is_draft)
+                        {
+                            ("OPEN", true) => ("Draft", Color::Muted),
+                            ("OPEN", false) => ("Open", Color::Success),
+                            ("MERGED", _) => ("Merged", Color::Accent),
+                            ("CLOSED", _) => ("Closed", Color::Muted),
+                            _ => (detail.state.as_str(), Color::Muted),
+                        };
+                        this.child(
+                            Chip::new(label.to_owned())
+                                .icon(IconName::PullRequest)
+                                .label_color(color)
+                                .icon_color(color),
+                        )
+                    }),
+            )
+            .when_some(self.detail.as_ref(), |this, detail| {
+                this.child(
+                    div()
+                        .id("pr-title")
+                        .debug_selector(|| "pr-title".into())
+                        .w_full()
+                        .min_w_0()
+                        .tooltip(Tooltip::text(detail.summary.title.clone()))
+                        .child(
+                            Label::new(detail.summary.title.clone())
+                                .size(LabelSize::Large)
+                                .weight(gpui::FontWeight::SEMIBOLD)
+                                .line_clamp(3),
+                        ),
+                )
+                .child(
+                    Label::new(format!("By {}", detail.summary.author_login()))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .truncate(),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .id("pr-head-branch")
+                                .debug_selector(|| "pr-head-branch".into())
+                                .min_w_0()
+                                .flex_1()
+                                .child(
+                                    Chip::new(detail.head_ref_name.clone())
+                                        .icon(IconName::GitBranch)
+                                        .truncate()
+                                        .tooltip(Tooltip::text(detail.head_ref_name.clone())),
+                                ),
+                        )
+                        .child(
+                            Icon::new(IconName::ArrowRight)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            h_flex()
+                                .id("pr-base-branch")
+                                .debug_selector(|| "pr-base-branch".into())
+                                .min_w_0()
+                                .max_w(relative(0.5))
+                                .child(
+                                    Chip::new(detail.base_ref_name.clone())
+                                        .icon(IconName::GitBranch)
+                                        .truncate()
+                                        .tooltip(Tooltip::text(detail.base_ref_name.clone())),
+                                ),
+                        ),
+                )
+            })
+            .child(
+                h_flex()
+                    .debug_selector(|| "pr-actions".into())
+                    .w_full()
+                    .min_w_0()
+                    .flex_wrap()
+                    .gap_1()
+                    .child(
+                        IconButton::new("pr-detail-refresh", IconName::RefreshTitle)
+                            .aria_label(REFRESH_PR_LABEL)
+                            .tab_index(0_isize)
+                            .tooltip(Tooltip::text(REFRESH_PR_LABEL))
+                            .disabled(self.loading)
+                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "pr-native-control".into())
+                            .flex_none()
+                            .child(
+                                Button::new("pr-diff-native", "View changes")
+                                    .tab_index(0_isize)
+                                    .style(ButtonStyle::Tinted(TintColor::Accent))
+                                    .tooltip(Tooltip::text(PR_FETCH_NOTICE))
+                                    .aria_description(PR_FETCH_NOTICE)
+                                    .disabled(self.detail.is_none() || self.diff_loading)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_diff(window, cx)
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "pr-github-control".into())
+                            .flex_none()
+                            .child(
+                                PopoverMenu::new("pr-github-menu")
+                                    .trigger(
+                                        Button::new("pr-github", "GitHub")
+                                            .tab_index(0_isize)
+                                            .end_icon(
+                                                Icon::new(IconName::ChevronDown)
+                                                    .size(IconSize::Small),
+                                            ),
+                                    )
+                                    .menu(move |window, cx| {
+                                        let url = url.clone();
+                                        let diff_url = format!("{url}/files");
+                                        Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                                            menu.entry(
+                                                "Open pull request on GitHub",
+                                                None,
+                                                move |_, cx| cx.open_url(&url),
+                                            )
+                                            .entry(
+                                                "Open diff on GitHub",
+                                                None,
+                                                move |_, cx| cx.open_url(&diff_url),
+                                            )
+                                        }))
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "pr-details-toggle".into())
+                            .flex_none()
+                            .child(
+                                Button::new("pr-details", "Details")
+                                    .tab_index(0_isize)
+                                    .aria_expanded(self.details_expanded)
+                                    .end_icon(
+                                        Icon::new(if self.details_expanded {
+                                            IconName::ChevronUp
+                                        } else {
+                                            IconName::ChevronDown
+                                        })
+                                        .size(IconSize::Small),
+                                    )
+                                    .toggle_state(self.details_expanded)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.details_expanded = !this.details_expanded;
+                                        if this.details_expanded {
+                                            // Reveal the expanded metadata even after scrolling a long description.
+                                            this.scroll_handle.set_offset(gpui::Point::default());
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+            .when(self.loading, |this| {
+                this.child(
+                    Label::new(if self.detail.is_some() {
+                        "Updating pull request…"
+                    } else {
+                        "Loading pull request…"
+                    })
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
+            })
+            .when(self.diff_loading, |this| {
+                this.child(
+                    Label::new("Preparing PR changes…")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .children(
+                [self.error.as_ref(), self.diff_error.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                    .map(|(index, error)| {
+                        div()
+                            .id(("pr-error", index))
+                            .w_full()
+                            .min_w_0()
+                            .tooltip(Tooltip::text(error.clone()))
+                            .child(Label::new(error.clone()).color(Color::Error).line_clamp(3))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_details(&self, cx: &Context<Self>) -> AnyElement {
+        v_flex().debug_selector(|| "pr-revision-details".into())
+            .w_full().min_w_0().p_3().gap_2().rounded_md()
+            .bg(cx.theme().colors().element_background)
+            .border_1().border_color(cx.theme().colors().border)
+            .when_some(self.detail.as_ref(), |this, detail| this.children(
+                [("Base", &detail.base_ref_oid), ("Head", &detail.head_ref_oid)].into_iter().map(|(label, oid)| {
+                    let oid = oid.clone();
+                    let copy = oid.clone();
+                    let copy_label = format!("Copy {label} commit ID");
+                    h_flex().w_full().min_w_0().gap_2()
+                        .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+                        .child(div().id(format!("pr-revision-{label}")).flex_1().min_w_0().tooltip(Tooltip::text(oid.clone()))
+                            .child(Label::new(oid).size(LabelSize::Small).truncate()))
+                        .child(IconButton::new(format!("pr-copy-{label}"), IconName::Copy)
+                            .tab_index(0_isize)
+                            .aria_label(copy_label.clone())
+                            .tooltip(Tooltip::text(copy_label))
+                            .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))))
+                })))
+            .child(Label::new("Metadata snapshot; refresh after a force-push. GitHub links show the latest published state.")
+                .size(LabelSize::Small).color(Color::Muted))
+            .child(Label::new(PR_FETCH_NOTICE).size(LabelSize::Small).color(Color::Muted))
+            .into_any_element()
+    }
+
+    fn render_markdown(&self) -> Option<AnyElement> {
+        let markdown = self.markdown.clone()?;
+        let menu_markdown = markdown.clone();
+        let menu_focus = self.focus_handle.clone();
+        let focus_handle = self.focus_handle.clone();
+        let scroll_handle = self.scroll_handle.clone();
+        Some(
+            right_click_menu("pr-description-menu")
+                .trigger(move |_, window, cx| {
+                    div()
+                        .debug_selector(|| "pr-markdown".into())
+                        .w_full()
+                        .child(
+                            MarkdownElement::new(
+                                markdown,
+                                MarkdownStyle::themed(MarkdownFont::Preview, window, cx),
+                            )
+                            .input_focus_handle(focus_handle)
+                            .scroll_handle(scroll_handle)
+                            .code_block_renderer(
+                                CodeBlockRenderer::Default {
+                                    copy_button_visibility: CopyButtonVisibility::VisibleOnHover,
+                                    wrap_button_visibility: WrapButtonVisibility::VisibleOnHover,
+                                    border: true,
+                                },
+                            ),
+                        )
+                })
+                .maybe_menu(move |window, cx| {
+                    let markdown = menu_markdown.read(cx);
+                    let text = markdown.context_menu_selected_text().cloned();
+                    let source = markdown.context_menu_selected_markdown().cloned();
+                    let link = markdown.context_menu_link().cloned();
+                    if text.is_none() && source.is_none() && link.is_none() {
+                        return None;
+                    }
+                    let focus = menu_focus.clone();
+                    Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                        menu.context(focus)
+                            .when_some(text, |menu, text| {
+                                menu.entry("Copy", Some(Box::new(markdown::Copy)), move |_, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        text.to_string(),
+                                    ))
+                                })
+                            })
+                            .when_some(source, |menu, source| {
+                                menu.entry(
+                                    "Copy as Markdown",
+                                    Some(Box::new(markdown::CopyAsMarkdown)),
+                                    move |_, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            source.to_string(),
+                                        ))
+                                    },
+                                )
+                            })
+                            .when_some(link, |menu, link| {
+                                menu.entry("Copy link", None, move |_, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        link.to_string(),
+                                    ))
+                                })
+                            })
+                    }))
+                })
+                .into_any_element(),
+        )
+    }
+}
+
 impl Render for PullRequestDescription {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let url = self.target.pull_request_url(self.number);
-        let diff_url = format!("{url}/files");
-        v_flex().id("pr-description").size_full().overflow_y_scroll().p_6()
-            .child(v_flex().w_full().max_w(rems(DESCRIPTION_WIDTH_REMS)).mx_auto().gap_3()
+        let markdown = self.render_markdown();
+        v_flex()
+            .id("pr-description")
+            .size_full()
+            .min_h_0()
+            .min_w_0()
             .track_focus(&self.focus_handle)
             .bg(cx.theme().colors().editor_background)
-            .child(Label::new(format!("{} #{}", self.target.slug(), self.number)))
-            .child(h_flex().flex_wrap().gap_2()
-                .child(Button::new("pr-detail-refresh", "Refresh description").on_click(cx.listener(|this, _, _, cx| this.refresh(cx))))
-                .child(Button::new("pr-browser", "Open on GitHub").on_click(move |_, _, cx| cx.open_url(&url)))
-                .child(Button::new("pr-diff-browser", "Open Diff on GitHub").on_click(move |_, _, cx| cx.open_url(&diff_url)))
-                .child(Button::new("pr-diff-native", "Preview changes in Zed")
-                    .disabled(self.detail.is_none() || self.diff_loading)
-                    .on_click(cx.listener(|this, _, window, cx| this.open_diff(window, cx)))))
-            .child(Label::new("Preview changes fetches missing Git objects on request. It never checks out a branch or changes your staged or unstaged edits.").size(LabelSize::Small).color(Color::Muted))
-            .when(self.diff_loading, |this| this.child(Label::new("Preparing PR changes…")))
-            .when_some(self.diff_error.clone(), |this, error| this.child(Label::new(error).color(Color::Error)))
-            .when(self.loading, |this| this.child(Label::new("Loading pull request…")))
-            .when_some(self.error.clone(), |this, error| this.child(Label::new(error).color(Color::Error)))
-            .when_some(self.detail.as_ref(), |this, detail| this
-                .child(Label::new(detail.summary.title.clone()).size(LabelSize::Large))
-                .child(Label::new(format!("By {} • {}{}", detail.summary.author_login(), detail.state, if detail.summary.is_draft { " • Draft" } else { "" })))
-                .child(Label::new(format!("{} ← {}", detail.base_ref_name, detail.head_ref_name)))
-                .child(Label::new(format!("Base: {}", detail.base_ref_oid)).size(LabelSize::Small))
-                .child(Label::new(format!("Head: {}", detail.head_ref_oid)).size(LabelSize::Small))
-                .child(Label::new("Metadata snapshot; refresh after a force-push. Browser links always show the latest GitHub state.").size(LabelSize::Small).color(Color::Muted)))
-            .when_some(self.markdown.clone(), |this, markdown| {
-                this.child(div().w_full().pt_3().border_t_1().border_color(cx.theme().colors().border)
-                    .child(MarkdownElement::new(markdown, MarkdownStyle::themed(MarkdownFont::Preview, window, cx))
-                        .code_block_renderer(CodeBlockRenderer::Default {
-                            copy_button_visibility: CopyButtonVisibility::VisibleOnHover,
-                            wrap_button_visibility: WrapButtonVisibility::VisibleOnHover,
-                            border: true,
-                        })))
-            }))
+            .child(self.render_header(cx))
+            .child(
+                v_flex()
+                    .id("pr-body")
+                    .debug_selector(|| "pr-body".into())
+                    .flex_1()
+                    .w_full()
+                    .min_h_0()
+                    .min_w_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll_handle)
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .min_w_0()
+                            .p_4()
+                            .gap_4()
+                            .when(self.details_expanded, |this| {
+                                this.child(self.render_details(cx))
+                            })
+                            .when_some(markdown, |this, markdown| {
+                                // Preview typography belongs to the body, not the native controls.
+                                this.child(
+                                    WithRemSize::new(
+                                        ThemeSettings::get_global(cx)
+                                            .markdown_preview_font_size(cx),
+                                    )
+                                    .w_full()
+                                    .min_w_0()
+                                    .child(
+                                        v_flex()
+                                            .w_full()
+                                            .min_w_0()
+                                            .max_w(rems(DESCRIPTION_WIDTH_REMS))
+                                            .mx_auto()
+                                            .child(markdown),
+                                    ),
+                                )
+                            }),
+                    )
+                    .vertical_scrollbar_for(&self.scroll_handle, window, cx),
+            )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Buttons activate on release; simulate_keystrokes only sends key-down.
+    fn press_enter(cx: &mut gpui::VisualTestContext) {
+        cx.refresh().expect("paint keyboard focus");
+        cx.run_until_parked();
+        let os = cx.update(|_, cx| cx.platform_info().os);
+        let keystroke = gpui::Keystroke::parse_with_os("enter", os).expect("enter");
+        cx.simulate_event(gpui::KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.simulate_event(gpui::KeyUpEvent { keystroke });
+    }
+
+    #[gpui::test]
+    async fn test_pr_detail_layout(cx: &mut gpui::TestAppContext) {
+        use gpui::UpdateGlobal;
+        use settings::Settings;
+
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            git::GitHostingProviderRegistry::default_global(cx);
+            git_hosting_providers::init(cx);
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(r#"{"markdown_preview":{"font_size":14}}"#, cx)
+                    .expect("initial preview font");
+            });
+        });
+        let fs = project::FakeFs::new(cx.background_executor.clone());
+        let project = Project::test(fs, [], cx).await;
+        let target = cx.update(|cx| {
+            GitHubRepository::from_remote_url(
+                git::GitHostingProviderRegistry::default_global(cx),
+                "https://github.com/example/project.git",
+            )
+            .expect("target")
+        });
+        let window = cx.add_window(|_, cx| {
+            let mut description = PullRequestDescription::new(
+                project, None, WeakEntity::new_invalid(), target, 1, cx,
+            );
+            description.set_detail(serde_json::from_value(serde_json::json!({
+                "number": 1, "title": "A descriptive pull request title that wraps in a narrow pane",
+                "author": {"login": "author"}, "isDraft": false, "state": "OPEN",
+                "body": "A short paragraph.\n\n".repeat(80),
+                "baseRefName": "main", "headRefName": "feature-with-a-very-long-branch-name".repeat(4),
+                "baseRefOid": "1".repeat(40), "headRefOid": "2".repeat(40)
+            })).expect("detail"), cx);
+            description.error = None;
+            description
+        });
+        let description = window.root(cx).expect("description");
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        for width in [320., 1200.] {
+            cx.simulate_resize(gpui::size(px(width), px(600.)));
+            cx.refresh().expect("render detail");
+            cx.run_until_parked();
+            let header = cx.debug_bounds("pr-header").expect("native header");
+            let actions = cx.debug_bounds("pr-actions").expect("native actions");
+            let body = cx.debug_bounds("pr-body").expect("scrolling body");
+            assert!(header.right() <= px(width));
+            assert!(actions.right() <= px(width));
+            assert!(body.top() >= actions.bottom());
+            assert!(body.bottom() <= px(600.));
+            for selector in [
+                "pr-title",
+                "pr-head-branch",
+                "pr-base-branch",
+                "ICON-RefreshTitle",
+                "pr-native-control",
+                "pr-github-control",
+                "pr-details-toggle",
+            ] {
+                let child = cx.debug_bounds(selector).expect("header descendant");
+                assert!(
+                    child.left() >= header.left() && child.right() <= header.right(),
+                    "overflow: {selector}"
+                );
+                assert!(
+                    child.top() >= header.top() && child.bottom() <= header.bottom(),
+                    "vertical overflow: {selector}"
+                );
+            }
+            assert!(cx.debug_bounds("pr-revision-details").is_none());
+            let markdown = cx.debug_bounds("pr-markdown").expect("description");
+            cx.simulate_event(gpui::ScrollEvent {
+                position: body.center(),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-200.))),
+                modifiers: Default::default(),
+                touch_phase: gpui::TouchPhase::Moved,
+                source: gpui::ScrollSource::Pointer,
+            });
+            cx.refresh().expect("scroll detail");
+            cx.run_until_parked();
+            assert_eq!(cx.debug_bounds("pr-header"), Some(header));
+            assert_eq!(cx.debug_bounds("pr-actions"), Some(actions));
+            assert!(
+                cx.debug_bounds("pr-markdown")
+                    .expect("scrolled description")
+                    .top()
+                    < markdown.top()
+            );
+            cx.update(|window, cx| {
+                window.blur(cx);
+                // Advance through Refresh, View changes and GitHub to Details.
+                for _ in ["Refresh", "View changes", "GitHub", "Details"] {
+                    window.focus_next(cx);
+                }
+            });
+            press_enter(&mut cx);
+            cx.refresh().expect("expand details by keyboard");
+            cx.run_until_parked();
+            let expanded = cx
+                .debug_bounds("pr-revision-details")
+                .expect("keyboard-expanded details");
+            assert!(expanded.top() >= body.top());
+            assert!(expanded.bottom() <= body.bottom());
+            assert!(expanded.left() >= body.left() && expanded.right() <= body.right());
+
+            for expected in ["1".repeat(40), "2".repeat(40)] {
+                cx.update(|window, cx| window.focus_next(cx));
+                press_enter(&mut cx);
+                let copied =
+                    cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()));
+                assert_eq!(copied, Some(expected), "copy full commit ID by keyboard");
+            }
+            let details = cx
+                .debug_bounds("pr-details-toggle")
+                .expect("details toggle");
+            cx.simulate_click(details.center(), gpui::Modifiers::default());
+            cx.refresh().expect("collapse details");
+            cx.run_until_parked();
+            assert!(cx.debug_bounds("pr-revision-details").is_none());
+        }
+        description.update(&mut cx, |description, cx| {
+            let detail = description.detail.as_mut().expect("detail");
+            detail.head_ref_name = detail.base_ref_name.clone();
+            cx.notify();
+        });
+        cx.refresh().expect("equal fork branch names");
+        cx.run_until_parked();
+
+        let before = cx
+            .debug_bounds("pr-markdown")
+            .expect("preview font baseline")
+            .size;
+        let actions = cx.debug_bounds("pr-actions");
+        cx.update(|_, cx| {
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(r#"{"markdown_preview":{"font_size":28}}"#, cx)
+                    .expect("preview settings");
+            });
+            assert_eq!(
+                theme_settings::ThemeSettings::get_global(cx).markdown_preview_font_size(cx),
+                px(28.)
+            );
+        });
+        cx.refresh().expect("preview font sizing");
+        cx.run_until_parked();
+        let after = cx.debug_bounds("pr-markdown").expect("larger preview").size;
+        assert!(after.height > before.height);
+        assert!(
+            after.width > before.width,
+            "reading width must use preview rem sizing"
+        );
+        assert_eq!(
+            cx.debug_bounds("pr-actions"),
+            actions,
+            "preview font must not resize controls"
+        );
+    }
 
     #[gpui::test]
     async fn test_remote_save_retry(cx: &mut gpui::TestAppContext) {
