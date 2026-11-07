@@ -7,9 +7,12 @@ use crate::branch_diff::BranchDiff;
 use crate::commit_context_menu::{
     CommitContextMenuData, CommitContextMenuSource, commit_context_menu,
 };
+use crate::commit_file_list::{
+    CommitFileList, CommitFileSummary, render_commit_file, summarize_commit_files,
+};
 use crate::commit_modal::CommitModal;
 use crate::commit_tooltip::{CommitAvatar, CommitTooltip};
-use crate::commit_view::CommitView;
+use crate::commit_view::{CommitView, CommitViewOptions};
 use crate::git_panel_settings::GitPanelScrollbarAccessor;
 use crate::project_diff::{Diff, ProjectDiff};
 use crate::pull_request_browser::PullRequestBrowser;
@@ -673,6 +676,23 @@ enum CommitHistory {
     /// An empty list means the repository has no commits.
     Loaded(Rc<[CommitHistoryEntry]>),
     Error(SharedString),
+}
+
+/// A row of the History tab's flat list. Commits whose file list is expanded
+/// contribute extra rows directly beneath them.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum HistoryRow {
+    Commit {
+        index: usize,
+    },
+    File {
+        index: usize,
+        file_index: usize,
+    },
+    /// Loading, failure, or "no files" feedback for an expanded commit.
+    FilesMessage {
+        index: usize,
+    },
 }
 
 /// Discarding only unstaged changes leaves the index alone, so such an op says
@@ -1377,6 +1397,9 @@ pub struct GitPanel {
     pull_request_browser: Option<Entity<PullRequestBrowser>>,
     commit_history_scroll_handle: UniformListScrollHandle,
     commit_history: CommitHistory,
+    /// Changed files for commits whose history rows are expanded.
+    history_commit_files: HashMap<Oid, CommitFileList>,
+    history_commit_file_tasks: HashMap<Oid, Task<()>>,
     focused_history_entry: Option<usize>,
     active_history_sha: Option<Oid>,
     history_keyboard_nav: bool,
@@ -1752,6 +1775,8 @@ impl GitPanel {
                 pull_request_browser: None,
                 commit_history_scroll_handle: UniformListScrollHandle::new(),
                 commit_history: CommitHistory::Loading,
+                history_commit_files: HashMap::default(),
+                history_commit_file_tasks: HashMap::default(),
                 focused_history_entry: None,
                 active_history_sha: None,
                 history_keyboard_nav: false,
@@ -5852,6 +5877,8 @@ impl GitPanel {
             self.update_active_history_sha(cx);
             self.reset_branch_state(window, cx);
             self.reset_pull_request_browser(window, cx);
+            self.history_commit_files.clear();
+            self.history_commit_file_tasks.clear();
         }
         self.reopen_commit_buffer(window, cx);
         self.preload_commit_history(cx);
@@ -6009,6 +6036,8 @@ impl GitPanel {
         if active_repository != self.active_repository {
             self.active_repository = active_repository;
             self.reset_pull_request_browser(window, cx);
+            self.history_commit_files.clear();
+            self.history_commit_file_tasks.clear();
             self.git_access = None;
             self.clear_marks();
             self.reset_branch_state(window, cx);
@@ -7930,7 +7959,7 @@ impl GitPanel {
         self.focused_history_entry = Some(new_index);
         self.history_keyboard_nav = true;
         self.commit_history_scroll_handle
-            .scroll_to_item(new_index, ScrollStrategy::Top);
+            .scroll_to_item(self.history_row_for_commit(new_index), ScrollStrategy::Top);
         cx.notify();
     }
 
@@ -7946,7 +7975,7 @@ impl GitPanel {
         self.focused_history_entry = Some(new_index);
         self.history_keyboard_nav = true;
         self.commit_history_scroll_handle
-            .scroll_to_item(new_index, ScrollStrategy::Top);
+            .scroll_to_item(self.history_row_for_commit(new_index), ScrollStrategy::Top);
         cx.notify();
     }
 
@@ -7968,6 +7997,83 @@ impl GitPanel {
             window,
             cx,
         );
+    }
+
+    fn toggle_history_commit_files(&mut self, sha: Oid, cx: &mut Context<Self>) {
+        if self.history_commit_files.remove(&sha).is_some() {
+            self.history_commit_file_tasks.remove(&sha);
+            cx.notify();
+            return;
+        }
+        let Some(active_repository) = self.active_repository.clone() else {
+            return;
+        };
+
+        let diff = active_repository.update(cx, |repository, cx| {
+            repository.load_commit_diff(sha.to_string(), false, cx)
+        });
+        self.history_commit_files
+            .insert(sha, CommitFileList::Loading);
+        self.history_commit_file_tasks.insert(
+            sha,
+            cx.spawn(async move |this, cx| {
+                let summaries = match diff.await {
+                    Ok(diff) => {
+                        let summaries = cx
+                            .background_spawn(async move { summarize_commit_files(&diff.files) })
+                            .await;
+                        Ok(CommitFileList::Loaded(summaries.into()))
+                    }
+                    Err(error) => Err(error),
+                };
+                this.update(cx, |this, cx| {
+                    // The row may have been collapsed, or the repository swapped, while loading.
+                    if !this.history_commit_files.contains_key(&sha) {
+                        return;
+                    }
+                    this.history_commit_files.insert(
+                        sha,
+                        summaries.unwrap_or_else(|error| {
+                            CommitFileList::Error(format!("{error:#}").into())
+                        }),
+                    );
+                    cx.notify();
+                })
+                .log_err();
+            }),
+        );
+        cx.notify();
+    }
+
+    /// Maps a commit index to its row in the flat History list, which also
+    /// contains the changed files of expanded commits.
+    fn history_row_for_commit(&self, index: usize) -> usize {
+        self.history_rows()
+            .iter()
+            .position(
+                |row| matches!(row, HistoryRow::Commit { index: row_index } if *row_index == index),
+            )
+            .unwrap_or(index)
+    }
+
+    fn history_rows(&self) -> Rc<[HistoryRow]> {
+        let mut rows = Vec::new();
+        for (index, entry) in self.commit_history_entries().iter().enumerate() {
+            rows.push(HistoryRow::Commit { index });
+            let Some(CommitFileList::Loaded(files)) = self.history_commit_files.get(&entry.sha)
+            else {
+                if self.history_commit_files.contains_key(&entry.sha) {
+                    rows.push(HistoryRow::FilesMessage { index });
+                }
+                continue;
+            };
+            if files.is_empty() {
+                rows.push(HistoryRow::FilesMessage { index });
+                continue;
+            }
+            rows.extend((0..files.len()).map(|file_index| HistoryRow::File { index, file_index }));
+        }
+        rows.into()
     }
 
     fn deploy_history_context_menu(
@@ -8209,7 +8315,30 @@ impl GitPanel {
         let active_repository = self.active_repository.as_ref()?;
         let workspace = self.workspace.clone();
         let repo_weak = active_repository.downgrade();
-        let item_count = entries.len();
+        let rows = self.history_rows();
+        let item_count = rows.len();
+        let expanded_shas: HashSet<Oid> = self.history_commit_files.keys().copied().collect();
+        let expanded_files: HashMap<Oid, Rc<[CommitFileSummary]>> = self
+            .history_commit_files
+            .iter()
+            .filter_map(|(sha, files)| match files {
+                CommitFileList::Loaded(files) => Some((*sha, files.clone())),
+                CommitFileList::Loading | CommitFileList::Error(_) => None,
+            })
+            .collect();
+        let expanded_messages: HashMap<Oid, SharedString> = self
+            .history_commit_files
+            .iter()
+            .filter_map(|(sha, files)| {
+                let message: SharedString = match files {
+                    CommitFileList::Loading => "Loading changed files…".into(),
+                    CommitFileList::Error(error) => error.clone(),
+                    CommitFileList::Loaded(files) if files.is_empty() => "No files changed".into(),
+                    CommitFileList::Loaded(_) => return None,
+                };
+                Some((*sha, message))
+            })
+            .collect();
         let commit_history_scroll_handle = self.commit_history_scroll_handle.clone();
         let remote = self.git_remote(cx);
 
@@ -8244,14 +8373,24 @@ impl GitPanel {
                         let git_panel = cx.weak_entity();
                         move |range, window, cx| {
                             let date_style = GitPanelSettings::get_global(cx).date_style;
-                            let visible_data: Vec<Option<Arc<CommitData>>> = repo_weak
+                            let visible_rows: Vec<HistoryRow> = rows
+                                .get(range.clone())
+                                .map(<[HistoryRow]>::to_vec)
+                                .unwrap_or_default();
+                            let commit_data: HashMap<Oid, Arc<CommitData>> = repo_weak
                                 .update(cx, |repository, cx| {
-                                    entries[range.clone()]
+                                    visible_rows
                                         .iter()
-                                        .map(|entry| {
+                                        .filter_map(|row| {
+                                            let HistoryRow::Commit { index } = row else {
+                                                return None;
+                                            };
+                                            let entry = entries.get(*index)?;
                                             match repository.fetch_commit_data(entry.sha, false, cx)
                                             {
-                                                CommitDataState::Loaded(data) => Some(data.clone()),
+                                                CommitDataState::Loaded(data) => {
+                                                    Some((entry.sha, data.clone()))
+                                                }
                                                 CommitDataState::Loading(_) => None,
                                             }
                                         })
@@ -8259,12 +8398,79 @@ impl GitPanel {
                                 })
                                 .unwrap_or_default();
 
-                            entries[range.clone()]
-                                .iter()
-                                .zip(visible_data)
-                                .enumerate()
-                                .map(|(ix, (entry, data))| {
-                                    let index = range.start + ix;
+                            let mut elements = Vec::with_capacity(visible_rows.len());
+                            for (offset, row) in visible_rows.into_iter().enumerate() {
+                                let row_index = range.start + offset;
+                                let index = match row {
+                                    HistoryRow::Commit { index }
+                                    | HistoryRow::File { index, .. }
+                                    | HistoryRow::FilesMessage { index } => index,
+                                };
+                                let Some(entry) = entries.get(index) else {
+                                    continue;
+                                };
+
+                                match row {
+                                    HistoryRow::File { file_index, .. } => {
+                                        let Some(file) = expanded_files
+                                            .get(&entry.sha)
+                                            .and_then(|files| files.get(file_index))
+                                        else {
+                                            continue;
+                                        };
+                                        let sha = entry.sha.to_string();
+                                        let repo = repo_weak.clone();
+                                        let workspace = workspace.clone();
+                                        let path = file.path.clone();
+                                        elements.push(render_commit_file(
+                                            ("commit-history-file", row_index),
+                                            file,
+                                            move |_, window, cx| {
+                                                CommitView::open(
+                                                    sha.clone(),
+                                                    repo.clone(),
+                                                    workspace.clone(),
+                                                    CommitViewOptions {
+                                                        reveal_file: Some(path.clone()),
+                                                        ..Default::default()
+                                                    },
+                                                    window,
+                                                    cx,
+                                                );
+                                            },
+                                            cx,
+                                        ));
+                                        continue;
+                                    }
+                                    HistoryRow::FilesMessage { .. } => {
+                                        let Some(message) = expanded_messages.get(&entry.sha)
+                                        else {
+                                            continue;
+                                        };
+                                        elements.push(
+                                            h_flex()
+                                                .w_full()
+                                                .min_w_0()
+                                                .py_1()
+                                                .pr_2()
+                                                .pl_6()
+                                                .child(
+                                                    Label::new(message.clone())
+                                                        .size(LabelSize::Small)
+                                                        .color(Color::Muted)
+                                                        .truncate(),
+                                                )
+                                                .into_any_element(),
+                                        );
+                                        continue;
+                                    }
+                                    HistoryRow::Commit { .. } => {}
+                                }
+
+                                let data = commit_data.get(&entry.sha).cloned();
+                                let is_expanded = expanded_shas.contains(&entry.sha);
+                                let sha_for_toggle = entry.sha;
+                                let element = {
                                     let sha_string = entry.sha.to_string();
                                     let sha_shared: SharedString = sha_string.clone().into();
                                     let short_sha: SharedString =
@@ -8357,6 +8563,35 @@ impl GitPanel {
                                                 .gap_1()
                                                 .w_full()
                                                 .min_w_0()
+                                                .child({
+                                                    let git_panel = git_panel.clone();
+                                                    IconButton::new(
+                                                        ("commit-history-disclosure", index),
+                                                        if is_expanded {
+                                                            IconName::ChevronDown
+                                                        } else {
+                                                            IconName::ChevronRight
+                                                        },
+                                                    )
+                                                    .icon_size(IconSize::XSmall)
+                                                    .icon_color(Color::Muted)
+                                                    .tooltip(Tooltip::text(if is_expanded {
+                                                        "Hide Changed Files"
+                                                    } else {
+                                                        "Show Changed Files"
+                                                    }))
+                                                    .on_click(move |_, _, cx| {
+                                                        cx.stop_propagation();
+                                                        git_panel
+                                                            .update(cx, |panel, cx| {
+                                                                panel.toggle_history_commit_files(
+                                                                    sha_for_toggle,
+                                                                    cx,
+                                                                );
+                                                            })
+                                                            .ok();
+                                                    })
+                                                })
                                                 .child(Label::new(subject).truncate())
                                                 .children((!tag_names.is_empty()).then(|| {
                                                     let hidden_tag_count = tag_names
@@ -8518,8 +8753,10 @@ impl GitPanel {
                                             );
                                         })
                                         .into_any_element()
-                                })
-                                .collect()
+                                };
+                                elements.push(element);
+                            }
+                            elements
                         }
                     })
                     .size_full()
@@ -10291,6 +10528,10 @@ impl Panel for GitPanel {
         (total > 0).then(|| total.to_string())
     }
 
+    fn shows_icon_indicator(&self, _: &Window, _: &App) -> bool {
+        self.changes_count > 0
+    }
+
     fn toggle_action(&self) -> Box<dyn Action> {
         Box::new(ToggleFocus)
     }
@@ -11879,6 +12120,55 @@ mod tests {
             test.history_state(),
             (Some(middle_sha), Some(1)),
             "closing the active commit view should highlight the commit view activated next"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_history_tab_expands_commit_files(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (mut test, [newest_sha, _, _]) = history_panel_with_commits(cx).await;
+
+        assert_eq!(
+            test.panel
+                .read_with(&test.cx, |panel, _| panel.history_rows().len()),
+            3,
+            "collapsed commits should contribute one row each"
+        );
+
+        test.panel.update(&mut test.cx, |panel, cx| {
+            panel.toggle_history_commit_files(newest_sha, cx)
+        });
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            test.panel
+                .read_with(&test.cx, |panel, _| panel.history_rows().to_vec()),
+            vec![
+                HistoryRow::Commit { index: 0 },
+                HistoryRow::FilesMessage { index: 0 },
+                HistoryRow::Commit { index: 1 },
+                HistoryRow::Commit { index: 2 },
+            ],
+            "an expanded commit without files should report that it has none"
+        );
+        assert_eq!(
+            test.panel
+                .read_with(&test.cx, |panel, _| panel.history_row_for_commit(1)),
+            2,
+            "expanded rows should shift the rows of later commits"
+        );
+
+        test.panel.update(&mut test.cx, |panel, cx| {
+            panel.toggle_history_commit_files(newest_sha, cx)
+        });
+        test.cx.run_until_parked();
+
+        assert_eq!(
+            test.panel
+                .read_with(&test.cx, |panel, _| panel.history_rows().len()),
+            3,
+            "collapsing should remove the file rows again"
         );
     }
 
