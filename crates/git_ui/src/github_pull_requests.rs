@@ -145,6 +145,7 @@ pub(super) const ACTIVITY_LIMIT: usize = 200;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ActivitySection {
     Timeline,
+    Commits,
     Threads,
 }
 
@@ -375,6 +376,17 @@ fn activity_arguments(
             } }
         }"#
         }
+        ActivitySection::Commits => {
+            r#"query($owner:String!,$name:String!,$number:Int!,$limit:Int!,$cursor:String) {
+            repository(owner:$owner,name:$name) { pullRequest(number:$number) {
+                number headRefOid commits(first:$limit,after:$cursor) {
+                    pageInfo { hasNextPage endCursor } edges { cursor node {
+                        commit { oid messageHeadline messageBody committedDate author { name user { login } } }
+                    } }
+                }
+            } }
+        }"#
+        }
         ActivitySection::Threads => {
             r#"query($owner:String!,$name:String!,$number:Int!,$limit:Int!,$cursor:String) {
             repository(owner:$owner,name:$name) { pullRequest(number:$number) {
@@ -452,6 +464,7 @@ fn parse_activity(bytes: &[u8], number: u64, section: ActivitySection) -> Result
     let head = activity_oid(json_string(pr, "headRefOid")?)?.to_string();
     let connection = &pr[match section {
         ActivitySection::Timeline => "timelineItems",
+        ActivitySection::Commits => "commits",
         ActivitySection::Threads => "reviewThreads",
     }];
     let edges = connection["edges"]
@@ -536,6 +549,22 @@ fn parse_activity(bytes: &[u8], number: u64, section: ActivitySection) -> Result
                 more_comments: node["comments"]["pageInfo"]["hasNextPage"]
                     .as_bool()
                     .context("Missing thread pagination")?,
+            };
+            items.push(item);
+            continue;
+        }
+        if section == ActivitySection::Commits {
+            let commit = &node["commit"];
+            item.author = commit["author"]["user"]["login"]
+                .as_str()
+                .or_else(|| commit["author"]["name"].as_str())
+                .unwrap_or("ghost")
+                .into();
+            item.date = json_string(commit, "committedDate")?.into();
+            item.body = json_string(commit, "messageBody")?.into();
+            item.kind = ActivityKind::Commit {
+                oid: activity_oid(json_string(commit, "oid")?)?,
+                title: json_string(commit, "messageHeadline")?.into(),
             };
             items.push(item);
             continue;
@@ -720,6 +749,7 @@ mod tests {
     fn activity_response(section: ActivitySection, nodes: serde_json::Value) -> serde_json::Value {
         let connection = match section {
             ActivitySection::Timeline => "timelineItems",
+            ActivitySection::Commits => "commits",
             ActivitySection::Threads => "reviewThreads",
         };
         let mut pr = serde_json::json!({"number":42,"headRefOid":"1111111111111111111111111111111111111111"});
@@ -744,7 +774,11 @@ mod tests {
         });
         let repository =
             parse_remote("git@github.enterprise.test:team/project.git").expect("target");
-        for section in [ActivitySection::Timeline, ActivitySection::Threads] {
+        for section in [
+            ActivitySection::Timeline,
+            ActivitySection::Commits,
+            ActivitySection::Threads,
+        ] {
             let arguments =
                 activity_arguments(&repository, 42, section, Some("opaque{cursor}".into()));
             assert_eq!(
@@ -763,6 +797,37 @@ mod tests {
             assert!(arguments.iter().any(|arg| arg == "cursor=opaque{cursor}"));
             assert!(!arguments.iter().any(|arg| arg == "--paginate"));
             assert!(arguments.iter().any(|arg| arg.starts_with("query=query(")));
+        }
+    }
+
+    #[test]
+    fn test_pr_commits_section() {
+        let oid = "a".repeat(40);
+        let value = activity_response(
+            ActivitySection::Commits,
+            serde_json::json!([{
+                "cursor": "commit-1",
+                "node": { "commit": {
+                    "oid": oid,
+                    "messageHeadline": "Fix the thing",
+                    "messageBody": "Details",
+                    "committedDate": "2024-04-01T00:00:00Z",
+                    "author": { "name": "Ada", "user": { "login": "ada" } }
+                } }
+            }]),
+        );
+        let page = parse_activity(value.to_string().as_bytes(), 42, ActivitySection::Commits)
+            .expect("commits page");
+        assert_eq!(page.items.len(), 1);
+        let item = &page.items[0];
+        assert_eq!(item.author, "ada");
+        assert_eq!(item.body, "Details");
+        match &item.kind {
+            ActivityKind::Commit { oid: parsed, title } => {
+                assert_eq!(parsed.to_string(), oid);
+                assert_eq!(title, "Fix the thing");
+            }
+            kind => panic!("the commits section must only yield commits, got {kind:?}"),
         }
     }
 

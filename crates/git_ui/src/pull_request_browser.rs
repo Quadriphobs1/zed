@@ -1,6 +1,9 @@
 use anyhow::{Context as _, Result, ensure};
 use db::kvp::KeyValueStore;
-use git::{Oid, repository::RevisionDiffMode};
+use git::{
+    Oid,
+    repository::{RepoPath, RevisionDiffMode},
+};
 use gpui::{
     App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, ScrollHandle,
     ScrollStrategy, Task, UniformListScrollHandle, WeakEntity, Window, uniform_list,
@@ -24,6 +27,7 @@ use ui::{
 use util::ResultExt as _;
 use workspace::{Item, Workspace};
 
+use crate::commit_file_list::{CommitFileSummary, summarize_commit_files};
 use crate::github_pull_requests::{
     GitHubRepository, PullRequestDetail, PullRequestFilter, PullRequestSummary, RESULT_LIMIT,
 };
@@ -626,6 +630,8 @@ struct PreviewRequest {
     mode: RevisionDiffMode,
     repository: Entity<Repository>,
     title: SharedString,
+    /// Loaded first so that it appears at the top of the diff view.
+    reveal_file: Option<RepoPath>,
 }
 
 struct PullRequestDescription {
@@ -707,10 +713,20 @@ impl PullRequestDescription {
         self.scroll_handle.set_offset(gpui::Point::default());
         if self.section == DetailSection::Activity && self.activity.is_none() {
             let description = cx.weak_entity();
-            let on_commit = std::rc::Rc::new(move |commit, window: &mut Window, cx: &mut App| {
+            let on_commit = std::rc::Rc::new({
+                let description = description.clone();
+                move |commit, reveal_file, window: &mut Window, cx: &mut App| {
+                    description
+                        .update(cx, |this, cx| {
+                            this.open_commit(commit, reveal_file, window, cx)
+                        })
+                        .log_err();
+                }
+            });
+            let load_commit_files = std::rc::Rc::new(move |commit, cx: &mut App| {
                 description
-                    .update(cx, |this, cx| this.open_commit(commit, window, cx))
-                    .log_err();
+                    .update(cx, |this, cx| this.load_commit_files(commit, cx))
+                    .unwrap_or_else(|error| Task::ready(Err(error)))
             });
             let activity = cx.new(|cx| {
                 PullRequestActivity::new(
@@ -719,6 +735,7 @@ impl PullRequestDescription {
                     self.number,
                     self.scroll_handle.clone(),
                     on_commit,
+                    load_commit_files,
                     cx,
                 )
             });
@@ -746,7 +763,38 @@ impl PullRequestDescription {
         cx.notify();
     }
 
-    fn open_commit(&mut self, commit: Oid, window: &mut Window, cx: &mut Context<Self>) {
+    /// Fetches the files a PR commit touches without opening a diff view.
+    fn load_commit_files(
+        &mut self,
+        commit: Oid,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<CommitFileSummary>>> {
+        let result = check_access(&self.project, cx).and_then(|()| {
+            self.repository
+                .clone()
+                .context("The PR repository is no longer available")
+        });
+        let repository = match result {
+            Ok(repository) => repository,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let source = format!("https://{}.git", self.target.target());
+        let response = repository.update(cx, |repository, cx| {
+            repository.fetch_pr_commit(source, commit, cx)
+        });
+        cx.background_spawn(async move {
+            let diff = response.await?;
+            Ok(summarize_commit_files(&diff.files))
+        })
+    }
+
+    fn open_commit(
+        &mut self,
+        commit: Oid,
+        reveal_file: Option<RepoPath>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.diff_loading {
             return;
         }
@@ -773,6 +821,7 @@ impl PullRequestDescription {
             repository,
             title,
             RevisionDiffMode::Direct,
+            reveal_file,
             window,
             cx,
         );
@@ -791,6 +840,7 @@ impl PullRequestDescription {
         repository: Entity<Repository>,
         title: SharedString,
         mode: RevisionDiffMode,
+        reveal_file: Option<RepoPath>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -800,6 +850,7 @@ impl PullRequestDescription {
             mode,
             repository,
             title,
+            reveal_file,
         };
         self.diff_error = None;
         self.diff_loading = true;
@@ -863,6 +914,7 @@ impl PullRequestDescription {
             repository,
             title,
             RevisionDiffMode::MergeBase,
+            None,
             window,
             cx,
         );
@@ -886,8 +938,17 @@ impl PullRequestDescription {
             return;
         };
         let result = (|| {
-            let snapshot = result?;
+            let mut snapshot = result?;
             check_access(&project, cx)?;
+            if let Some(reveal_file) = &request.reveal_file
+                && let Some(index) = snapshot
+                    .files
+                    .iter()
+                    .position(|file| &file.path == reveal_file)
+            {
+                let file = snapshot.files.remove(index);
+                snapshot.files.insert(0, file);
+            }
 
             // Adding a pane item reads existing items; do not hold the description's lease.
             workspace.update(cx, |workspace, cx| {
@@ -2066,6 +2127,7 @@ mod tests {
                             mode: RevisionDiffMode::MergeBase,
                             repository: repository.clone(),
                             title: "PR changes".into(),
+                            reveal_file: None,
                         },
                         window,
                         cx,

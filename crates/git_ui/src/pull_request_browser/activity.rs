@@ -1,4 +1,5 @@
 use super::{DESCRIPTION_WIDTH_REMS, check_access};
+use crate::commit_file_list::{CommitFileList, CommitFileSummary, render_commit_file};
 use crate::github_pull_requests::{
     ACTIVITY_LIMIT, ACTIVITY_PAGE_SIZE, ActivityItem, ActivityKind, ActivityPage, ActivitySection,
     GitHubPullRequestService, GitHubRepository,
@@ -6,6 +7,7 @@ use crate::github_pull_requests::{
 use anyhow::{Result, ensure};
 use collections::HashMap;
 use git::Oid;
+use git::repository::RepoPath;
 use gpui::{App, Context, Entity, FocusHandle, ScrollHandle, Task, Window};
 use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont,
@@ -23,7 +25,10 @@ const ACTIVITY_TEXT_LIMIT: usize = 4 * 1024 * 1024;
 const SHORT_COMMIT_LENGTH: usize = 8;
 const MIN_CODE_FENCE: usize = 3;
 
-type CommitCallback = Rc<dyn Fn(Oid, &mut Window, &mut App)>;
+/// Opens a commit's diff, optionally revealing one repository-relative path first.
+type CommitCallback = Rc<dyn Fn(Oid, Option<RepoPath>, &mut Window, &mut App)>;
+/// Loads the files a PR commit touches, summarized for list rendering.
+type CommitFilesCallback = Rc<dyn Fn(Oid, &mut App) -> Task<Result<Vec<CommitFileSummary>>>>;
 type ActivityLoader = Arc<
     dyn Fn(
             GitHubRepository,
@@ -158,6 +163,9 @@ pub(super) struct PullRequestActivity {
     focus: FocusHandle,
     scroll: ScrollHandle,
     on_commit: CommitCallback,
+    load_commit_files: CommitFilesCallback,
+    commit_files: HashMap<Oid, CommitFileList>,
+    commit_file_tasks: HashMap<Oid, Task<()>>,
     load_page: ActivityLoader,
     busy: bool,
 }
@@ -171,6 +179,7 @@ impl PullRequestActivity {
         number: u64,
         scroll: ScrollHandle,
         on_commit: CommitCallback,
+        load_commit_files: CommitFilesCallback,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
@@ -184,6 +193,9 @@ impl PullRequestActivity {
             focus: cx.focus_handle(),
             scroll,
             on_commit,
+            load_commit_files,
+            commit_files: HashMap::default(),
+            commit_file_tasks: HashMap::default(),
             load_page: Arc::new(|target, number, section, cursor| {
                 Box::pin(async move {
                     GitHubPullRequestService::activity(&target, number, section, cursor).await
@@ -197,6 +209,36 @@ impl PullRequestActivity {
         self.load(LoadMode::Replace, cx);
     }
 
+    fn toggle_commit_files(&mut self, oid: Oid, cx: &mut Context<Self>) {
+        if self.commit_files.remove(&oid).is_some() {
+            self.commit_file_tasks.remove(&oid);
+            cx.notify();
+            return;
+        }
+        let files = (self.load_commit_files)(oid, cx);
+        self.commit_files.insert(oid, CommitFileList::Loading);
+        self.commit_file_tasks.insert(
+            oid,
+            cx.spawn(async move |this, cx| {
+                let files = files.await;
+                this.update(cx, |this, cx| {
+                    // The row may have been collapsed, or the activity reloaded, while loading.
+                    if !this.commit_files.contains_key(&oid) {
+                        return;
+                    }
+                    let state = match files {
+                        Ok(files) => CommitFileList::Loaded(files.into()),
+                        Err(error) => CommitFileList::Error(format!("{error:#}").into()),
+                    };
+                    this.commit_files.insert(oid, state);
+                    cx.notify();
+                })
+                .log_err();
+            }),
+        );
+        cx.notify();
+    }
+
     pub(super) fn set_preview(&mut self, state: PreviewState, cx: &mut Context<Self>) {
         self.busy = matches!(state, PreviewState::Loading);
         cx.notify();
@@ -207,6 +249,8 @@ impl PullRequestActivity {
         let generation = self.state.start(mode);
         if matches!(mode, LoadMode::Replace) {
             self.markdown.clear();
+            self.commit_files.clear();
+            self.commit_file_tasks.clear();
             self.busy = false;
             cx.emit(ActivityReloaded);
         }
@@ -349,7 +393,7 @@ impl PullRequestActivity {
         item: &ActivityItem,
         view: &ItemView,
         window: &mut Window,
-        cx: &mut App,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut row = v_flex()
             .id(item.id.clone())
@@ -372,13 +416,91 @@ impl PullRequestActivity {
                 let oid = *oid;
                 let short: String = oid.to_string().chars().take(SHORT_COMMIT_LENGTH).collect();
                 let on_commit = self.on_commit.clone();
-                row.child(Label::new(format!("{short}  {title}")).truncate().weight(gpui::FontWeight::SEMIBOLD))
+                let is_expanded = self.commit_files.contains_key(&oid);
+                let mut commit = row
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .gap_1p5()
+                            .child(
+                                IconButton::new(
+                                    ElementId::Name(format!("pr-commit-files-{oid}").into()),
+                                    if is_expanded {
+                                        IconName::ChevronDown
+                                    } else {
+                                        IconName::ChevronRight
+                                    },
+                                )
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .tooltip(ui::Tooltip::text(if is_expanded {
+                                    "Hide Changed Files"
+                                } else {
+                                    "Show Changed Files"
+                                }))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.toggle_commit_files(oid, cx)
+                                })),
+                            )
+                            .child(
+                                Label::new(format!("{short}  {title}"))
+                                    .truncate()
+                                    .weight(gpui::FontWeight::SEMIBOLD),
+                            ),
+                    )
                     .child(div().debug_selector(|| "pr-commit-changes".into()).child(
-                        Button::new("pr-commit-changes", "View changes")
+                        Button::new(ElementId::Name(format!("pr-commit-changes-{oid}").into()), "View changes")
                             .tab_index(0_isize).aria_label(format!("View changes for commit {oid}"))
                             .disabled(self.busy)
                             .tooltip(ui::Tooltip::text("Read-only first-parent commit diff; missing objects are downloaded into temporary storage"))
-                            .on_click(move |_, window, cx| on_commit(oid, window, cx))))
+                            .on_click(move |_, window, cx| on_commit(oid, None, window, cx))));
+                match self.commit_files.get(&oid) {
+                    None => {}
+                    Some(CommitFileList::Loading) => {
+                        commit = commit.child(
+                            Label::new("Loading changed files…")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        );
+                    }
+                    Some(CommitFileList::Error(error)) => {
+                        commit = commit.child(
+                            Label::new(error.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Error),
+                        );
+                    }
+                    Some(CommitFileList::Loaded(files)) if files.is_empty() => {
+                        commit = commit.child(
+                            Label::new("No files changed")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        );
+                    }
+                    Some(CommitFileList::Loaded(files)) => {
+                        let container = v_flex()
+                            .debug_selector(|| "pr-commit-files".into())
+                            .w_full()
+                            .min_w_0();
+                        commit = commit.child(files.iter().enumerate().fold(
+                            container,
+                            |container, (index, file)| {
+                                let on_commit = self.on_commit.clone();
+                                let path = file.path.clone();
+                                container.child(render_commit_file(
+                                    ElementId::Name(format!("pr-commit-file-{oid}-{index}").into()),
+                                    file,
+                                    move |_, window, cx| {
+                                        on_commit(oid, Some(path.clone()), window, cx)
+                                    },
+                                    cx,
+                                ))
+                            },
+                        ));
+                    }
+                }
+                commit
             }
             ActivityKind::Comment => row.child(
                 Label::new("Comment")
@@ -478,8 +600,8 @@ impl Render for PullRequestActivity {
         let url = self.target.pull_request_url(self.number);
         let mut body = v_flex().debug_selector(||"pr-activity".into()).w_full().min_w_0().gap_3().track_focus(&self.focus)
             .child(h_flex().debug_selector(||"pr-activity-controls".into()).w_full().min_w_0().flex_wrap().gap_1()
-                .children([(ActivitySection::Timeline,"Timeline"),(ActivitySection::Threads,"Review threads")].into_iter().map(|(section,label)| {
-                    div().debug_selector(move || match section { ActivitySection::Timeline => "pr-activity-timeline".into(), ActivitySection::Threads => "pr-activity-threads".into() })
+                .children([(ActivitySection::Timeline,"Timeline"),(ActivitySection::Commits,"Commits"),(ActivitySection::Threads,"Review threads")].into_iter().map(|(section,label)| {
+                    div().debug_selector(move || match section { ActivitySection::Timeline => "pr-activity-timeline".into(), ActivitySection::Commits => "pr-activity-commits".into(), ActivitySection::Threads => "pr-activity-threads".into() })
                         .child(Button::new(label,label).tab_index(0_isize).toggle_state(self.section == section).on_click(cx.listener(move |this, _, _, cx| {
                             this.section = section;
                             this.scroll.set_offset(gpui::Point::default());
@@ -746,9 +868,9 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         activity.update(&mut cx, |activity, cx| {
             let native = activity.on_commit.clone();
-            activity.on_commit = Rc::new(move |oid, window, cx| {
+            activity.on_commit = Rc::new(move |oid, reveal_file, window, cx| {
                 assert_eq!(oid, commit, "the selected commit is not the PR head");
-                native(oid, window, cx);
+                native(oid, reveal_file, window, cx);
             });
             let requests = requests.clone();
             activity.load_page = Arc::new(move |target, number, section, cursor| {
@@ -908,7 +1030,8 @@ mod tests {
                 target,
                 42,
                 ScrollHandle::new(),
-                Rc::new(|_, _, _| {}),
+                Rc::new(|_, _, _, _| {}),
+                Rc::new(|_, _| Task::ready(Ok(Vec::new()))),
                 cx,
             );
             let mut page = page("scroll-thread", None);
@@ -1094,6 +1217,7 @@ mod tests {
                         fixture.repository.clone(),
                         "Commit preview".into(),
                         RevisionDiffMode::Direct,
+                        None,
                         window,
                         cx,
                     )
@@ -1132,6 +1256,7 @@ mod tests {
                         mode: RevisionDiffMode::Direct,
                         repository: fixture.repository.clone(),
                         title: "Late obsolete commit".into(),
+                        reveal_file: None,
                     },
                     window,
                     cx,
@@ -1160,6 +1285,7 @@ mod tests {
                         fixture.repository.clone(),
                         "Root commit".into(),
                         RevisionDiffMode::Direct,
+                        None,
                         window,
                         cx,
                     )
@@ -1194,7 +1320,8 @@ mod tests {
                 target,
                 42,
                 ScrollHandle::new(),
-                Rc::new(|_, _, _| {}),
+                Rc::new(|_, _, _, _| {}),
+                Rc::new(|_, _| Task::ready(Ok(Vec::new()))),
                 cx,
             )
         });

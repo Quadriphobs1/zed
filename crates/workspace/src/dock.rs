@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore, TerminalDockPosition};
 use std::sync::Arc;
 use ui::{
-    ContextMenu, CountBadge, Divider, DividerColor, IconButton, Tooltip, prelude::*,
+    ContextMenu, CountBadge, Divider, DividerColor, IconButton, Indicator, Tooltip, prelude::*,
     right_click_menu,
 };
 use util::ResultExt as _;
@@ -74,6 +74,10 @@ pub trait Panel: Focusable + EventEmitter<PanelEvent> + Render + Sized {
     fn icon_label(&self, _window: &Window, _: &App) -> Option<String> {
         None
     }
+    /// Draws an unread-style dot over this panel's status bar button.
+    fn shows_icon_indicator(&self, _window: &Window, _cx: &App) -> bool {
+        false
+    }
     fn is_zoomed(&self, _window: &Window, _cx: &App) -> bool {
         false
     }
@@ -126,6 +130,7 @@ pub trait PanelHandle: Send + Sync {
     fn icon_tooltip(&self, window: &Window, cx: &App) -> Option<&'static str>;
     fn toggle_action(&self, window: &Window, cx: &App) -> Box<dyn Action>;
     fn icon_label(&self, window: &Window, cx: &App) -> Option<String>;
+    fn shows_icon_indicator(&self, window: &Window, cx: &App) -> bool;
     fn panel_focus_handle(&self, cx: &App) -> FocusHandle;
     /// See `Panel::activation_focus_handle`.
     fn activation_focus_handle(&self, cx: &App) -> FocusHandle;
@@ -241,6 +246,10 @@ where
 
     fn icon_label(&self, window: &Window, cx: &App) -> Option<String> {
         self.read(cx).icon_label(window, cx)
+    }
+
+    fn shows_icon_indicator(&self, window: &Window, cx: &App) -> bool {
+        self.read(cx).shows_icon_indicator(window, cx)
     }
 
     fn to_any(&self) -> AnyView {
@@ -1443,6 +1452,7 @@ impl Render for PanelButtons {
 
                 let focus_handle = dock.panel_button_focus_handle(window, cx);
                 let icon_label = entry.panel.icon_label(window, cx);
+                let shows_icon_indicator = entry.panel.shows_icon_indicator(window, cx);
 
                 Some(
                     right_click_menu(name)
@@ -1557,13 +1567,27 @@ impl Render for PanelButtons {
                                     })
                                 });
 
-                            div().relative().child(button).when_some(
-                                icon_label
-                                    .clone()
-                                    .filter(|_| !is_active_button)
-                                    .and_then(|label| label.parse::<usize>().ok()),
-                                |this, count| this.child(CountBadge::new(count)),
-                            )
+                            let count = icon_label
+                                .clone()
+                                .filter(|_| !is_active_button)
+                                .and_then(|label| label.parse::<usize>().ok());
+
+                            div()
+                                .relative()
+                                .child(button)
+                                .when_some(count, |this, count| this.child(CountBadge::new(count)))
+                                .when(
+                                    count.is_none() && shows_icon_indicator && !is_active_button,
+                                    |this| {
+                                        this.child(
+                                            div()
+                                                .absolute()
+                                                .top_0()
+                                                .right_0()
+                                                .child(Indicator::dot().color(Color::Info)),
+                                        )
+                                    },
+                                )
                         }),
                 )
             })
