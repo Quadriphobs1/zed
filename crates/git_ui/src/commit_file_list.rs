@@ -64,9 +64,9 @@ fn file_status(status: CommitFileStatus) -> FileStatus {
     })
 }
 
-/// Renders one changed file. The layout intentionally uses two lines so that
-/// rows stay the same height as the commit rows they are nested under, which
-/// `uniform_list` requires.
+/// Renders one changed file on a single line: status, name, directory and
+/// line counts. `uniform_list` sizes every row from its first item, so this
+/// row fills the height it is given rather than defining it.
 pub(crate) fn render_commit_file(
     id: impl Into<ElementId>,
     file: &CommitFileSummary,
@@ -87,39 +87,31 @@ pub(crate) fn render_commit_file(
         .into();
     let full_path: SharedString = file.path.as_unix_str().to_string().into();
 
-    v_flex()
+    h_flex()
         .id(id.into())
         .cursor_pointer()
         .w_full()
         .min_w_0()
-        .py_1()
+        .h_full()
+        .items_center()
+        .py_0p5()
         .pr_2()
         .pl_6()
-        .gap_0p5()
+        .gap_1p5()
         .hover(|style| style.bg(cx.theme().colors().element_hover))
         .tooltip(ui::Tooltip::text(full_path))
-        .child(
-            h_flex()
-                .w_full()
-                .min_w_0()
-                .gap_1p5()
-                .child(git_status_icon(file_status(file.status)))
-                .child(Label::new(file_name).truncate())
-                .child(div().flex_1())
-                .child(render_diff_stat(file)),
-        )
-        .child(
-            h_flex().w_full().min_w_0().child(
-                Label::new(if directory.is_empty() {
-                    SharedString::new_static("(repository root)")
-                } else {
-                    directory
-                })
-                .size(LabelSize::Small)
-                .color(Color::Muted)
-                .truncate(),
-            ),
-        )
+        .child(git_status_icon(file_status(file.status)))
+        .child(Label::new(file_name).truncate())
+        .when(!directory.is_empty(), |this| {
+            this.child(
+                Label::new(directory)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .truncate(),
+            )
+        })
+        .child(div().flex_1())
+        .child(render_diff_stat(file))
         .on_click(move |event, window, cx| on_click(event, window, cx))
         .into_any_element()
 }
