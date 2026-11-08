@@ -6,8 +6,8 @@ use git::{
     repository::{RepoPath, RevisionDiffMode},
 };
 use gpui::{
-    App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, ScrollHandle,
-    ScrollStrategy, Task, UniformListScrollHandle, WeakEntity, Window, uniform_list,
+    App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, ListAlignment,
+    ListState as GpuiListState, ScrollHandle, Task, WeakEntity, Window, list,
 };
 use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont,
@@ -212,7 +212,10 @@ pub(super) struct PullRequestBrowser {
     filter: PullRequestFilter,
     state: ListState,
     selected_entry: Option<usize>,
-    scroll_handle: UniformListScrollHandle,
+    /// Pull request rows, their commits and changed files have different
+    /// heights, so this list measures each row instead of assuming one height.
+    list_state: GpuiListState,
+    rows: Rc<[BrowserRow]>,
     task: Task<()>,
     /// Commits of expanded pull requests, keyed by pull request number.
     pull_request_commits: HashMap<u64, PullRequestCommits>,
@@ -257,7 +260,8 @@ impl PullRequestBrowser {
             filter: PullRequestFilter::All,
             state: ListState::default(),
             selected_entry: None,
-            scroll_handle: UniformListScrollHandle::new(),
+            list_state: GpuiListState::new(0, ListAlignment::Top, ui::px(400.)),
+            rows: Rc::from([]),
             task: Task::ready(()),
             pull_request_commits: HashMap::default(),
             pull_request_commit_tasks: HashMap::default(),
@@ -380,7 +384,8 @@ impl PullRequestBrowser {
         self.commit_files.clear();
         self.commit_file_tasks.clear();
         self.preview_error = None;
-        self.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
+        self.refresh_rows();
+        self.list_state.scroll_to_reveal_item(0);
         let generation = self.state.begin();
         let target = self
             .selected_remote
@@ -400,6 +405,7 @@ impl PullRequestBrowser {
         let (snapshot, response) = PullRequestCache::list(scope, target, self.filter, policy, cx);
         if let Some(snapshot) = snapshot {
             self.state.entries = snapshot;
+            self.refresh_rows();
         }
         self.task = cx.spawn(async move |this, cx| {
             let result = response
@@ -429,6 +435,7 @@ impl PullRequestBrowser {
                 .iter()
                 .position(|entry| entry.number == number)
         });
+        self.refresh_rows();
     }
 
     fn open_entry(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -643,18 +650,38 @@ impl PullRequestBrowser {
             .map(|(_, target)| target.clone())
     }
 
-    /// Lists the rows of the pull request list, including the commits of
-    /// expanded pull requests and the files of expanded commits.
-    fn rows(&self) -> Rc<[BrowserRow]> {
-        browser_rows(
+    /// Recomputes the rows of the pull request list, including the commits of
+    /// expanded pull requests and the files of expanded commits, and tells the
+    /// list which rows changed so unchanged measurements survive.
+    fn refresh_rows(&mut self) {
+        let rows = browser_rows(
             &self.state.entries,
             &self.pull_request_commits,
             &self.commit_files,
-        )
+        );
+        let old_rows = std::mem::replace(&mut self.rows, rows.clone());
+        if *old_rows == *rows {
+            return;
+        }
+        let prefix = old_rows
+            .iter()
+            .zip(rows.iter())
+            .take_while(|(old, new)| old == new)
+            .count();
+        let suffix = old_rows[prefix..]
+            .iter()
+            .rev()
+            .zip(rows[prefix..].iter().rev())
+            .take_while(|(old, new)| old == new)
+            .count();
+        self.list_state.splice(
+            prefix..old_rows.len() - suffix,
+            rows.len() - prefix - suffix,
+        );
     }
 
     fn row_for_pull_request(&self, index: usize) -> usize {
-        self.rows()
+        self.rows
             .iter()
             .position(|row| matches!(row, BrowserRow::PullRequest { index: row_index } if *row_index == index))
             .unwrap_or(index)
@@ -666,6 +693,7 @@ impl PullRequestBrowser {
         };
         if self.pull_request_commits.remove(&number).is_some() {
             self.pull_request_commit_tasks.remove(&number);
+            self.refresh_rows();
             cx.notify();
             return;
         }
@@ -678,12 +706,14 @@ impl PullRequestBrowser {
                     number,
                     PullRequestCommits::Error(format!("{error:#}").into()),
                 );
+                self.refresh_rows();
                 cx.notify();
                 return;
             }
         };
         self.pull_request_commits
             .insert(number, PullRequestCommits::Loading);
+        self.refresh_rows();
         self.pull_request_commit_tasks.insert(
             number,
             cx.spawn(async move |this, cx| {
@@ -722,6 +752,7 @@ impl PullRequestBrowser {
                         Err(error) => PullRequestCommits::Error(format!("{error:#}").into()),
                     };
                     this.pull_request_commits.insert(number, state);
+                    this.refresh_rows();
                     cx.notify();
                 })
                 .log_err();
@@ -733,6 +764,7 @@ impl PullRequestBrowser {
     fn toggle_commit_files(&mut self, commit: Oid, cx: &mut Context<Self>) {
         if self.commit_files.remove(&commit).is_some() {
             self.commit_file_tasks.remove(&commit);
+            self.refresh_rows();
             cx.notify();
             return;
         }
@@ -749,6 +781,7 @@ impl PullRequestBrowser {
             Err(error) => {
                 self.commit_files
                     .insert(commit, CommitFileList::Error(format!("{error:#}").into()));
+                self.refresh_rows();
                 cx.notify();
                 return;
             }
@@ -758,6 +791,7 @@ impl PullRequestBrowser {
             repository.fetch_pr_commit(source, commit, cx)
         });
         self.commit_files.insert(commit, CommitFileList::Loading);
+        self.refresh_rows();
         self.commit_file_tasks.insert(
             commit,
             cx.spawn(async move |this, cx| {
@@ -779,6 +813,7 @@ impl PullRequestBrowser {
                         Err(error) => CommitFileList::Error(format!("{error:#}").into()),
                     };
                     this.commit_files.insert(commit, state);
+                    this.refresh_rows();
                     cx.notify();
                 })
                 .log_err();
@@ -868,8 +903,8 @@ impl PullRequestBrowser {
             (None, _) => 0,
         };
         self.selected_entry = Some(index);
-        self.scroll_handle
-            .scroll_to_item(self.row_for_pull_request(index), ScrollStrategy::Top);
+        self.list_state
+            .scroll_to_reveal_item(self.row_for_pull_request(index));
         cx.notify();
     }
 }
@@ -1016,27 +1051,20 @@ impl Render for PullRequestBrowser {
                 )
             })
             .child(
-                uniform_list(
-                    "pr-list",
-                    self.rows().len(),
-                    cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
-                        let rows = this.rows();
-                        rows.get(range.clone())
-                            .unwrap_or_default()
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(offset, row)| {
-                                let row_index = range.start + offset;
-                                match *row {
-                                    BrowserRow::PullRequest { index } => {
-                                        Some(this.render_pull_request_row(index, cx))
-                                    }
-                                    BrowserRow::PullRequestMessage { index } => {
-                                        let entry = this.state.entries.get(index)?;
-                                        let message = match this
-                                            .pull_request_commits
-                                            .get(&entry.number)?
-                                        {
+                list(
+                    self.list_state.clone(),
+                    cx.processor(|this, row_index: usize, _, cx| {
+                        let rows = this.rows.clone();
+                        rows.get(row_index)
+                            .into_iter()
+                            .filter_map(|row| match *row {
+                                BrowserRow::PullRequest { index } => {
+                                    Some(this.render_pull_request_row(index, cx))
+                                }
+                                BrowserRow::PullRequestMessage { index } => {
+                                    let entry = this.state.entries.get(index)?;
+                                    let message =
+                                        match this.pull_request_commits.get(&entry.number)? {
                                             PullRequestCommits::Loading => {
                                                 SharedString::new_static("Loading commits\u{2026}")
                                             }
@@ -1045,66 +1073,63 @@ impl Render for PullRequestBrowser {
                                                 SharedString::new_static("No commits")
                                             }
                                         };
-                                        Some(render_list_message(message, 4.))
-                                    }
-                                    BrowserRow::Commit {
-                                        index,
-                                        commit_index,
-                                    } => this.render_commit_row(index, commit_index, cx),
-                                    BrowserRow::CommitMessage {
-                                        index,
-                                        commit_index,
-                                    } => {
-                                        let commit =
-                                            this.pull_request_commit(index, commit_index)?;
-                                        let message = match this.commit_files.get(&commit.oid)? {
-                                            CommitFileList::Loading => SharedString::new_static(
-                                                "Loading changed files\u{2026}",
-                                            ),
-                                            CommitFileList::Error(error) => error.clone(),
-                                            CommitFileList::Loaded(_) => {
-                                                SharedString::new_static("No files changed")
-                                            }
-                                        };
-                                        Some(render_list_message(message, 6.))
-                                    }
-                                    BrowserRow::File {
-                                        index,
-                                        commit_index,
-                                        file_index,
-                                    } => {
-                                        let commit =
-                                            this.pull_request_commit(index, commit_index)?;
-                                        let oid = commit.oid;
-                                        let CommitFileList::Loaded(files) =
-                                            this.commit_files.get(&oid)?
-                                        else {
-                                            return None;
-                                        };
-                                        let file = files.get(file_index)?;
-                                        let path = file.path.clone();
-                                        Some(render_commit_file(
-                                            ("pr-commit-file", row_index),
-                                            file,
-                                            cx.listener(move |this, _, window, cx| {
-                                                this.open_commit_preview(
-                                                    oid,
-                                                    Some(path.clone()),
-                                                    window,
-                                                    cx,
-                                                );
-                                            }),
-                                            cx,
-                                        ))
-                                    }
+                                    Some(render_list_message(message, 4.))
+                                }
+                                BrowserRow::Commit {
+                                    index,
+                                    commit_index,
+                                } => this.render_commit_row(index, commit_index, cx),
+                                BrowserRow::CommitMessage {
+                                    index,
+                                    commit_index,
+                                } => {
+                                    let commit = this.pull_request_commit(index, commit_index)?;
+                                    let message = match this.commit_files.get(&commit.oid)? {
+                                        CommitFileList::Loading => SharedString::new_static(
+                                            "Loading changed files\u{2026}",
+                                        ),
+                                        CommitFileList::Error(error) => error.clone(),
+                                        CommitFileList::Loaded(_) => {
+                                            SharedString::new_static("No files changed")
+                                        }
+                                    };
+                                    Some(render_list_message(message, 6.))
+                                }
+                                BrowserRow::File {
+                                    index,
+                                    commit_index,
+                                    file_index,
+                                } => {
+                                    let commit = this.pull_request_commit(index, commit_index)?;
+                                    let oid = commit.oid;
+                                    let CommitFileList::Loaded(files) =
+                                        this.commit_files.get(&oid)?
+                                    else {
+                                        return None;
+                                    };
+                                    let file = files.get(file_index)?;
+                                    let path = file.path.clone();
+                                    Some(render_commit_file(
+                                        ("pr-commit-file", row_index),
+                                        file,
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.open_commit_preview(
+                                                oid,
+                                                Some(path.clone()),
+                                                window,
+                                                cx,
+                                            );
+                                        }),
+                                        cx,
+                                    ))
                                 }
                             })
-                            .collect()
+                            .next()
+                            .unwrap_or_else(|| div().into_any_element())
                     }),
                 )
                 .flex_1()
-                .size_full()
-                .track_scroll(&self.scroll_handle),
+                .size_full(),
             )
     }
 }
@@ -2766,6 +2791,7 @@ mod tests {
                 {"number": 1, "title": "A long pull request title that must truncate rather than clip its beginning".repeat(5), "author": {"login": "author"}, "isDraft": false},
                 {"number": 2, "title": "Short title", "author": {"login": "author"}, "isDraft": true}
             ])).expect("PR fixture");
+            browser.refresh_rows();
             browser
         });
         let browser = window.root(cx).expect("browser");

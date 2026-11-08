@@ -58,9 +58,9 @@ use git::{
 use gpui::{
     AbsoluteLength, Action, Anchor, AnyElement, AsyncApp, AsyncWindowContext, ClickEvent,
     ClipboardItem, DismissEvent, Empty, Entity, EventEmitter, FocusHandle, Focusable, KeyContext,
-    MouseButton, MouseDownEvent, Pixels, Point, PromptLevel, ScrollStrategy, Subscription, Task,
-    TaskExt, TextStyle, UniformListScrollHandle, WeakEntity, actions, anchored, deferred,
-    uniform_list,
+    ListAlignment, ListState, MouseButton, MouseDownEvent, Pixels, Point, PromptLevel,
+    ScrollStrategy, Subscription, Task, TaskExt, TextStyle, UniformListScrollHandle, WeakEntity,
+    actions, anchored, deferred, list, uniform_list,
 };
 use itertools::Itertools;
 use language::{Buffer, BufferEvent, File};
@@ -1395,7 +1395,10 @@ pub struct GitPanel {
     stash_entries: GitStash,
     active_tab: GitPanelTab,
     pull_request_browser: Option<Entity<PullRequestBrowser>>,
-    commit_history_scroll_handle: UniformListScrollHandle,
+    /// The History tab mixes two-line commit rows with single-line file rows,
+    /// so it uses a variable-height list instead of a uniform one.
+    commit_history_list: ListState,
+    commit_history_rows: Rc<[HistoryRow]>,
     commit_history: CommitHistory,
     /// Changed files for commits whose history rows are expanded.
     history_commit_files: HashMap<Oid, CommitFileList>,
@@ -1773,7 +1776,8 @@ impl GitPanel {
                 stash_entries: Default::default(),
                 active_tab: GitPanelTab::Changes,
                 pull_request_browser: None,
-                commit_history_scroll_handle: UniformListScrollHandle::new(),
+                commit_history_list: ListState::new(0, ListAlignment::Top, px(400.)),
+                commit_history_rows: Rc::from([]),
                 commit_history: CommitHistory::Loading,
                 history_commit_files: HashMap::default(),
                 history_commit_file_tasks: HashMap::default(),
@@ -5879,6 +5883,7 @@ impl GitPanel {
             self.reset_pull_request_browser(window, cx);
             self.history_commit_files.clear();
             self.history_commit_file_tasks.clear();
+            self.refresh_history_rows();
         }
         self.reopen_commit_buffer(window, cx);
         self.preload_commit_history(cx);
@@ -6038,6 +6043,7 @@ impl GitPanel {
             self.reset_pull_request_browser(window, cx);
             self.history_commit_files.clear();
             self.history_commit_file_tasks.clear();
+            self.refresh_history_rows();
             self.git_access = None;
             self.clear_marks();
             self.reset_branch_state(window, cx);
@@ -7958,8 +7964,8 @@ impl GitPanel {
         };
         self.focused_history_entry = Some(new_index);
         self.history_keyboard_nav = true;
-        self.commit_history_scroll_handle
-            .scroll_to_item(self.history_row_for_commit(new_index), ScrollStrategy::Top);
+        self.commit_history_list
+            .scroll_to_reveal_item(self.history_row_for_commit(new_index));
         cx.notify();
     }
 
@@ -7974,8 +7980,8 @@ impl GitPanel {
         };
         self.focused_history_entry = Some(new_index);
         self.history_keyboard_nav = true;
-        self.commit_history_scroll_handle
-            .scroll_to_item(self.history_row_for_commit(new_index), ScrollStrategy::Top);
+        self.commit_history_list
+            .scroll_to_reveal_item(self.history_row_for_commit(new_index));
         cx.notify();
     }
 
@@ -8002,6 +8008,7 @@ impl GitPanel {
     fn toggle_history_commit_files(&mut self, sha: Oid, cx: &mut Context<Self>) {
         if self.history_commit_files.remove(&sha).is_some() {
             self.history_commit_file_tasks.remove(&sha);
+            self.refresh_history_rows();
             cx.notify();
             return;
         }
@@ -8037,6 +8044,7 @@ impl GitPanel {
                             CommitFileList::Error(format!("{error:#}").into())
                         }),
                     );
+                    this.refresh_history_rows();
                     cx.notify();
                 })
                 .log_err();
@@ -8045,10 +8053,35 @@ impl GitPanel {
         cx.notify();
     }
 
+    /// Recomputes the History rows and tells the list which ones changed, so
+    /// that scroll position and measurements of unchanged rows survive.
+    fn refresh_history_rows(&mut self) {
+        let rows = self.history_rows();
+        let old_rows = std::mem::replace(&mut self.commit_history_rows, rows.clone());
+        if *old_rows == *rows {
+            return;
+        }
+        let prefix = old_rows
+            .iter()
+            .zip(rows.iter())
+            .take_while(|(old, new)| old == new)
+            .count();
+        let suffix = old_rows[prefix..]
+            .iter()
+            .rev()
+            .zip(rows[prefix..].iter().rev())
+            .take_while(|(old, new)| old == new)
+            .count();
+        self.commit_history_list.splice(
+            prefix..old_rows.len() - suffix,
+            rows.len() - prefix - suffix,
+        );
+    }
+
     /// Maps a commit index to its row in the flat History list, which also
     /// contains the changed files of expanded commits.
     fn history_row_for_commit(&self, index: usize) -> usize {
-        self.history_rows()
+        self.commit_history_rows
             .iter()
             .position(
                 |row| matches!(row, HistoryRow::Commit { index: row_index } if *row_index == index),
@@ -8273,6 +8306,7 @@ impl GitPanel {
             .or_else(|| self.active_history_entry_index());
         self.focused_history_entry =
             focused.and_then(|focused| (count > 0).then(|| focused.min(count - 1)));
+        self.refresh_history_rows();
         if changed {
             cx.notify();
         }
@@ -8315,8 +8349,7 @@ impl GitPanel {
         let active_repository = self.active_repository.as_ref()?;
         let workspace = self.workspace.clone();
         let repo_weak = active_repository.downgrade();
-        let rows = self.history_rows();
-        let item_count = rows.len();
+        let rows = self.commit_history_rows.clone();
         let expanded_shas: HashSet<Oid> = self.history_commit_files.keys().copied().collect();
         let expanded_files: HashMap<Oid, Rc<[CommitFileSummary]>> = self
             .history_commit_files
@@ -8339,7 +8372,6 @@ impl GitPanel {
                 Some((*sha, message))
             })
             .collect();
-        let commit_history_scroll_handle = self.commit_history_scroll_handle.clone();
         let remote = self.git_remote(cx);
 
         let focused_history_entry = self.focused_history_entry;
@@ -8367,11 +8399,12 @@ impl GitPanel {
                 .size_full()
                 .overflow_hidden()
                 .child(
-                    uniform_list("commit_history_list", item_count, {
+                    list(self.commit_history_list.clone(), {
                         let workspace = workspace;
                         let repo_weak = repo_weak;
                         let git_panel = cx.weak_entity();
-                        move |range, window, cx| {
+                        move |row_index, window, cx| {
+                            let range = row_index..row_index + 1;
                             let date_style = GitPanelSettings::get_global(cx).date_style;
                             let visible_rows: Vec<HistoryRow> = rows
                                 .get(range.clone())
@@ -8756,13 +8789,12 @@ impl GitPanel {
                                 };
                                 elements.push(element);
                             }
-                            elements
+                            elements.pop().unwrap_or_else(|| div().into_any_element())
                         }
                     })
-                    .size_full()
-                    .track_scroll(&commit_history_scroll_handle),
+                    .size_full(),
                 )
-                .vertical_scrollbar_for(&commit_history_scroll_handle, window, cx),
+                .vertical_scrollbar_for(&self.commit_history_list, window, cx),
         )
     }
 
