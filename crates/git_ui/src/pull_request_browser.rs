@@ -28,6 +28,7 @@ use ui::{
 use util::ResultExt as _;
 use workspace::{Item, Workspace};
 
+use crate::change_overview::{ChangeOverview, build_change_overview, narrate_overview};
 use crate::commit_file_list::{CommitFileList, render_commit_file};
 use crate::commit_file_list::{CommitFileSummary, summarize_commit_files};
 use crate::github_pull_requests::{
@@ -42,8 +43,9 @@ mod activity;
 use activity::{ActivityReloaded, PreviewState, PullRequestActivity};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum DetailSection {
+pub(super) enum DetailSection {
     Description,
+    Overview,
     Activity,
 }
 
@@ -1230,6 +1232,13 @@ struct PullRequestDescription {
     preview_generation: usize,
     details_expanded: bool,
     section: DetailSection,
+    overview: Option<Entity<Markdown>>,
+    overview_narration: Option<Entity<Markdown>>,
+    overview_summary: Option<ChangeOverview>,
+    overview_error: Option<String>,
+    overview_loading: bool,
+    overview_narrating: bool,
+    overview_task: Task<()>,
     activity: Option<Entity<PullRequestActivity>>,
     activity_subscription: Option<gpui::Subscription>,
     scroll_handle: ScrollHandle,
@@ -1267,6 +1276,13 @@ impl PullRequestDescription {
             preview_generation: 0,
             details_expanded: false,
             section: DetailSection::Description,
+            overview: None,
+            overview_narration: None,
+            overview_summary: None,
+            overview_error: None,
+            overview_loading: false,
+            overview_narrating: false,
+            overview_task: Task::ready(()),
             activity: None,
             activity_subscription: None,
             scroll_handle: ScrollHandle::new(),
@@ -1282,11 +1298,8 @@ impl PullRequestDescription {
         }
     }
 
-    fn toggle_activity(&mut self, cx: &mut Context<Self>) {
-        self.section = match self.section {
-            DetailSection::Description => DetailSection::Activity,
-            DetailSection::Activity => DetailSection::Description,
-        };
+    pub(super) fn show_section(&mut self, section: DetailSection, cx: &mut Context<Self>) {
+        self.section = section;
         self.scroll_handle.set_offset(gpui::Point::default());
         if self.section == DetailSection::Activity && self.activity.is_none() {
             let description = cx.weak_entity();
@@ -1553,6 +1566,153 @@ impl PullRequestDescription {
         .log_err();
     }
 
+    /// Builds a structural, code-free picture of the pull request. The diff is
+    /// fetched the same way the preview fetches it, but nothing is opened.
+    fn build_overview(&mut self, cx: &mut Context<Self>) {
+        if self.overview_loading {
+            return;
+        }
+        let result = (|| {
+            check_access(&self.project, cx)?;
+            let detail = self
+                .detail
+                .as_ref()
+                .context("Load the pull request before building an overview")?;
+            let repository = self
+                .repository
+                .clone()
+                .context("The PR repository is no longer available")?;
+            let base = Oid::from_str(&detail.base_ref_oid).context("Invalid PR base revision")?;
+            let head = Oid::from_str(&detail.head_ref_oid).context("Invalid PR head revision")?;
+            anyhow::Ok((repository, base, head))
+        })();
+        let (repository, base, head) = match result {
+            Ok(revisions) => revisions,
+            Err(error) => {
+                self.overview_error = Some(format!("{error:#}"));
+                cx.notify();
+                return;
+            }
+        };
+
+        let source = format!("https://{}.git", self.target.target());
+        let head_ref = format!("refs/pull/{}/head", self.number);
+        let diff = repository.update(cx, |repository, cx| {
+            repository.fetch_pr_objects(source.clone(), base, head, head_ref, cx)
+        });
+        let commits = cx.background_spawn({
+            let target = self.target.clone();
+            let number = self.number;
+            async move {
+                GitHubPullRequestService::activity(&target, number, ActivitySection::Commits, None)
+                    .await
+            }
+        });
+        let title: SharedString = format!("{} #{}", self.target.slug(), self.number).into();
+        let languages = self.project.read(cx).languages().clone();
+
+        self.overview_error = None;
+        self.overview_loading = true;
+        self.overview_narration = None;
+        self.overview_task = cx.spawn(async move |this, cx| {
+            let diff = diff.await;
+            // Commits are decoration: a failure there must not lose the diff.
+            let commits = commits
+                .await
+                .map(|page| {
+                    page.items
+                        .iter()
+                        .filter_map(|item| match &item.kind {
+                            ActivityKind::Commit { oid, title } => Some((
+                                oid.to_string().chars().take(8).collect::<String>().into(),
+                                SharedString::from(title.clone()),
+                            )),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            let overview = match diff {
+                Ok(diff) => {
+                    cx.update(|cx| {
+                        build_change_overview(title, diff.files, commits, Some(languages), cx)
+                    })
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+
+            this.update(cx, |this, cx| {
+                this.overview_loading = false;
+                match overview {
+                    Ok(overview) => {
+                        let markdown = overview.to_markdown();
+                        this.overview = Some(cx.new(|cx| {
+                            Markdown::new_with_options(
+                                markdown.into(),
+                                Some(this.project.read(cx).languages().clone()),
+                                None,
+                                markdown::MarkdownOptions {
+                                    render_mermaid_diagrams: true,
+                                    ..Default::default()
+                                },
+                                cx,
+                            )
+                        }));
+                        this.overview_summary = Some(overview);
+                    }
+                    Err(error) => this.overview_error = Some(format!("{error:#}")),
+                }
+                cx.notify();
+            })
+            .log_err();
+        });
+        cx.notify();
+    }
+
+    /// Asks a configured model to narrate the structure that was computed
+    /// locally. The model never sees the diff itself.
+    fn narrate_overview(&mut self, cx: &mut Context<Self>) {
+        if self.overview_narrating {
+            return;
+        }
+        let Some(overview) = self.overview_summary.clone() else {
+            self.overview_error = Some("Build the overview before narrating it".into());
+            cx.notify();
+            return;
+        };
+        let narration = narrate_overview(&overview, cx);
+        self.overview_error = None;
+        self.overview_narrating = true;
+        self.overview_task = cx.spawn(async move |this, cx| {
+            let narration = narration.await;
+            this.update(cx, |this, cx| {
+                this.overview_narrating = false;
+                match narration {
+                    Ok(narration) => {
+                        this.overview_narration = Some(cx.new(|cx| {
+                            Markdown::new_with_options(
+                                narration.into(),
+                                Some(this.project.read(cx).languages().clone()),
+                                None,
+                                markdown::MarkdownOptions {
+                                    render_mermaid_diagrams: true,
+                                    ..Default::default()
+                                },
+                                cx,
+                            )
+                        }));
+                    }
+                    Err(error) => this.overview_error = Some(format!("{error:#}")),
+                }
+                cx.notify();
+            })
+            .log_err();
+        });
+        cx.notify();
+    }
+
     fn load_detail(&mut self, policy: CachePolicy, cx: &mut Context<Self>) {
         self.cancel_diff();
         if let Some(activity) = &self.activity {
@@ -1801,21 +1961,29 @@ impl PullRequestDescription {
                             ),
                     )
                     .child(
-                        div()
+                        h_flex()
                             .debug_selector(|| "pr-activity-toggle".into())
                             .flex_none()
-                            .child(
-                                Button::new(
-                                    "pr-activity-toggle",
-                                    if self.section == DetailSection::Description {
-                                        "Activity"
-                                    } else {
-                                        "Description"
-                                    },
-                                )
-                                .tab_index(0_isize)
-                                .toggle_state(self.section == DetailSection::Activity)
-                                .on_click(cx.listener(|this, _, _, cx| this.toggle_activity(cx))),
+                            .gap_1()
+                            .children(
+                                [
+                                    (DetailSection::Description, "Description"),
+                                    (DetailSection::Overview, "Overview"),
+                                    (DetailSection::Activity, "Activity"),
+                                ]
+                                .into_iter()
+                                .map(|(section, label)| {
+                                    div()
+                                        .debug_selector(move || format!("pr-section-{label}"))
+                                        .child(
+                                            Button::new(label, label)
+                                                .tab_index(0_isize)
+                                                .toggle_state(self.section == section)
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.show_section(section, cx)
+                                                })),
+                                        )
+                                }),
                             ),
                     ),
             )
@@ -1877,6 +2045,100 @@ impl PullRequestDescription {
             .child(Label::new("Metadata snapshot; refresh after a force-push. GitHub links show the latest published state.")
                 .size(LabelSize::Small).color(Color::Muted))
             .child(Label::new(PR_FETCH_NOTICE).size(LabelSize::Small).color(Color::Muted))
+            .into_any_element()
+    }
+
+    fn render_overview(&self, window: &mut Window, cx: &Context<Self>) -> AnyElement {
+        let render_markdown = |markdown: &Entity<Markdown>, window: &mut Window, cx: &App| {
+            WithRemSize::new(ThemeSettings::get_global(cx).markdown_preview_font_size(cx))
+                .w_full()
+                .min_w_0()
+                .child(
+                    MarkdownElement::new(
+                        markdown.clone(),
+                        MarkdownStyle::themed(MarkdownFont::Preview, window, cx),
+                    )
+                    .input_focus_handle(self.focus_handle.clone())
+                    .scroll_handle(self.scroll_handle.clone())
+                    .code_block_renderer(CodeBlockRenderer::Default {
+                        copy_button_visibility: CopyButtonVisibility::VisibleOnHover,
+                        wrap_button_visibility: WrapButtonVisibility::VisibleOnHover,
+                        border: true,
+                    }),
+                )
+                .into_any_element()
+        };
+
+        v_flex()
+            .debug_selector(|| "pr-overview".into())
+            .w_full()
+            .min_w_0()
+            .gap_3()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .flex_wrap()
+                    .child(
+                        Button::new(
+                            "pr-overview-build",
+                            if self.overview.is_some() {
+                                "Rebuild overview"
+                            } else {
+                                "Build overview"
+                            },
+                        )
+                        .tab_index(0_isize)
+                        .disabled(self.overview_loading || self.detail.is_none())
+                        .tooltip(Tooltip::text(
+                            "Summarizes the changed files and symbols locally; downloads the PR objects into temporary storage",
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| this.build_overview(cx))),
+                    )
+                    .child(
+                        Button::new("pr-overview-narrate", "Explain with AI")
+                            .tab_index(0_isize)
+                            .disabled(
+                                self.overview_summary.is_none()
+                                    || self.overview_narrating
+                                    || self.overview_loading,
+                            )
+                            .tooltip(Tooltip::text(
+                                "Sends only the file and symbol structure, never the code, to the configured model",
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| this.narrate_overview(cx))),
+                    ),
+            )
+            .child(
+                Label::new(
+                    "Structure is computed locally from the diff. The optional explanation is generated from that structure alone.",
+                )
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+            )
+            .when(self.overview_loading, |this| {
+                this.child(Label::new("Building overview\u{2026}").color(Color::Muted))
+            })
+            .when(self.overview_narrating, |this| {
+                this.child(Label::new("Explaining changes\u{2026}").color(Color::Muted))
+            })
+            .when_some(self.overview_error.clone(), |this, error| {
+                this.child(Label::new(error).color(Color::Error))
+            })
+            .when(
+                self.overview.is_none() && !self.overview_loading && self.overview_error.is_none(),
+                |this| {
+                    this.child(
+                        Label::new("No overview yet. Build one to see which files and symbols this pull request touches.")
+                            .color(Color::Muted),
+                    )
+                },
+            )
+            .when_some(self.overview.clone(), |this, markdown| {
+                this.child(render_markdown(&markdown, window, cx))
+            })
+            .when_some(self.overview_narration.clone(), |this, markdown| {
+                this.child(render_markdown(&markdown, window, cx))
+            })
             .into_any_element()
     }
 
@@ -1987,6 +2249,9 @@ impl Render for PullRequestDescription {
                             })
                             .when(self.section == DetailSection::Activity, |this| {
                                 this.children(self.activity.clone())
+                            })
+                            .when(self.section == DetailSection::Overview, |this| {
+                                this.child(self.render_overview(window, cx))
                             })
                             .when_some(markdown, |this, markdown| {
                                 // Preview typography belongs to the body, not the native controls.
@@ -2144,8 +2409,10 @@ mod tests {
             assert!(expanded.bottom() <= body.bottom());
             assert!(expanded.left() >= body.left() && expanded.right() <= body.right());
 
-            // The Activity navigation follows Details before the expanded SHA controls.
-            cx.update(|window, cx| window.focus_next(cx));
+            // The section buttons follow Details before the expanded SHA controls.
+            for _ in ["Description", "Overview", "Activity"] {
+                cx.update(|window, cx| window.focus_next(cx));
+            }
             for expected in ["1".repeat(40), "2".repeat(40)] {
                 cx.update(|window, cx| window.focus_next(cx));
                 press_enter(&mut cx);

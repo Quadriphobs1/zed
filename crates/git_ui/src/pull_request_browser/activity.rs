@@ -805,7 +805,15 @@ mod tests {
         cx.run_until_parked();
         cx.update(|window, cx| {
             window.blur(cx);
-            for _ in ["Refresh", "View changes", "GitHub", "Details", "Activity"] {
+            for _ in [
+                "Refresh",
+                "View changes",
+                "GitHub",
+                "Details",
+                "Description",
+                "Overview",
+                "Activity",
+            ] {
                 window.focus_next(cx);
             }
         });
@@ -951,14 +959,32 @@ mod tests {
                 (ActivitySection::Threads, None)
             ]
         );
-        let toggle = cx
-            .debug_bounds("pr-activity-toggle")
+        // The Overview section explains itself before anything has been built.
+        let overview_section = cx
+            .debug_bounds("pr-section-Overview")
+            .expect("overview section");
+        cx.simulate_click(overview_section.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("pr-overview").is_some());
+        assert!(cx.debug_bounds("pr-activity").is_none());
+        description.read_with(&cx, |description, _| {
+            assert!(
+                description.overview_summary.is_none(),
+                "an overview must only be built on request"
+            );
+        });
+
+        let description_section = cx
+            .debug_bounds("pr-section-Description")
             .expect("return to description");
-        cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+        let activity_section = cx
+            .debug_bounds("pr-section-Activity")
+            .expect("activity section");
+        cx.simulate_click(description_section.center(), gpui::Modifiers::default());
         cx.run_until_parked();
         assert!(cx.debug_bounds("pr-markdown").is_some());
         assert!(cx.debug_bounds("pr-activity").is_none());
-        cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+        cx.simulate_click(activity_section.center(), gpui::Modifiers::default());
         cx.run_until_parked();
         assert!(
             cx.debug_bounds("pr-review-comment-1").is_some(),
@@ -1191,9 +1217,9 @@ mod tests {
     #[gpui::test(iterations = 5)]
     async fn test_activity_review_cancel(cx: &mut TestAppContext) {
         let fixture = preview_fixture(cx).await;
-        fixture
-            .description
-            .update(cx, |description, cx| description.toggle_activity(cx));
+        fixture.description.update(cx, |description, cx| {
+            description.show_section(crate::pull_request_browser::DetailSection::Activity, cx)
+        });
         let activity = fixture.description.read_with(cx, |description, _| {
             description.activity.clone().expect("activity")
         });
