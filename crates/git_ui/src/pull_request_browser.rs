@@ -1,4 +1,5 @@
 use anyhow::{Context as _, Result, ensure};
+use collections::HashMap;
 use db::kvp::KeyValueStore;
 use git::{
     Oid,
@@ -27,12 +28,15 @@ use ui::{
 use util::ResultExt as _;
 use workspace::{Item, Workspace};
 
+use crate::commit_file_list::{CommitFileList, render_commit_file};
 use crate::commit_file_list::{CommitFileSummary, summarize_commit_files};
 use crate::github_pull_requests::{
-    GitHubRepository, PullRequestDetail, PullRequestFilter, PullRequestSummary, RESULT_LIMIT,
+    ActivityKind, ActivitySection, GitHubPullRequestService, GitHubRepository, PullRequestDetail,
+    PullRequestFilter, PullRequestSummary, RESULT_LIMIT,
 };
 use crate::pull_request_cache::{CachePolicy, PullRequestCache};
 use crate::revision_diff::RevisionDiffView;
+use std::rc::Rc;
 
 mod activity;
 use activity::{ActivityReloaded, PreviewState, PullRequestActivity};
@@ -118,6 +122,48 @@ fn remote_key(path: &std::path::Path) -> String {
         .collect()
 }
 
+/// One commit of a pull request, as reported by GitHub.
+#[derive(Clone, Debug)]
+struct PullRequestCommit {
+    oid: Oid,
+    title: SharedString,
+    author: SharedString,
+}
+
+/// The state of a lazily loaded commit list for one pull request.
+enum PullRequestCommits {
+    Loading,
+    Loaded(Rc<[PullRequestCommit]>),
+    Error(SharedString),
+}
+
+/// A row of the pull request list. Expanded pull requests contribute their
+/// commits, and expanded commits contribute their changed files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowserRow {
+    PullRequest {
+        index: usize,
+    },
+    /// Loading, failure, or "no commits" feedback for an expanded pull request.
+    PullRequestMessage {
+        index: usize,
+    },
+    Commit {
+        index: usize,
+        commit_index: usize,
+    },
+    /// Loading, failure, or "no files" feedback for an expanded commit.
+    CommitMessage {
+        index: usize,
+        commit_index: usize,
+    },
+    File {
+        index: usize,
+        commit_index: usize,
+        file_index: usize,
+    },
+}
+
 enum SelectionDirection {
     Next,
     Previous,
@@ -168,6 +214,14 @@ pub(super) struct PullRequestBrowser {
     selected_entry: Option<usize>,
     scroll_handle: UniformListScrollHandle,
     task: Task<()>,
+    /// Commits of expanded pull requests, keyed by pull request number.
+    pull_request_commits: HashMap<u64, PullRequestCommits>,
+    pull_request_commit_tasks: HashMap<u64, Task<()>>,
+    /// Changed files of expanded commits.
+    commit_files: HashMap<Oid, CommitFileList>,
+    commit_file_tasks: HashMap<Oid, Task<()>>,
+    preview_task: Task<()>,
+    preview_error: Option<String>,
 }
 
 impl PullRequestBrowser {
@@ -205,6 +259,12 @@ impl PullRequestBrowser {
             selected_entry: None,
             scroll_handle: UniformListScrollHandle::new(),
             task: Task::ready(()),
+            pull_request_commits: HashMap::default(),
+            pull_request_commit_tasks: HashMap::default(),
+            commit_files: HashMap::default(),
+            commit_file_tasks: HashMap::default(),
+            preview_task: Task::ready(()),
+            preview_error: None,
         };
         this.load_remotes(cx);
         this
@@ -315,6 +375,11 @@ impl PullRequestBrowser {
     fn load_list(&mut self, policy: CachePolicy, cx: &mut Context<Self>) {
         self.task = Task::ready(());
         self.selected_entry = None;
+        self.pull_request_commits.clear();
+        self.pull_request_commit_tasks.clear();
+        self.commit_files.clear();
+        self.commit_file_tasks.clear();
+        self.preview_error = None;
         self.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
         let generation = self.state.begin();
         let target = self
@@ -398,6 +463,399 @@ impl PullRequestBrowser {
             .log_err();
     }
 
+    fn pull_request_commit(&self, index: usize, commit_index: usize) -> Option<&PullRequestCommit> {
+        let entry = self.state.entries.get(index)?;
+        let PullRequestCommits::Loaded(commits) = self.pull_request_commits.get(&entry.number)?
+        else {
+            return None;
+        };
+        commits.get(commit_index)
+    }
+
+    fn render_pull_request_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(entry) = self.state.entries.get(index) else {
+            return div().into_any_element();
+        };
+        let is_expanded = self.pull_request_commits.contains_key(&entry.number);
+        let number = entry.number;
+        let is_draft = entry.is_draft;
+        let title = entry.title.clone();
+        let author = entry.author_login().to_owned();
+
+        v_flex()
+            .id(("pr-entry", index))
+            .debug_selector(move || format!("pr-row-{index}"))
+            .cursor_pointer()
+            .w_full()
+            .min_w_0()
+            .py_1()
+            .px_2()
+            .gap_0p5()
+            .border_1()
+            .border_color(gpui::transparent_black())
+            .hover(|style| style.bg(cx.theme().colors().element_hover))
+            .when(self.selected_entry == Some(index), |row| {
+                row.border_color(cx.theme().colors().panel_focused_border)
+            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_1()
+                    .child(
+                        IconButton::new(
+                            ("pr-disclosure", index),
+                            if is_expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            },
+                        )
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text(if is_expanded {
+                            "Hide Commits"
+                        } else {
+                            "Show Commits"
+                        }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_pull_request_commits(index, cx);
+                        })),
+                    )
+                    .child(Label::new(title).truncate()),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_1p5()
+                    .child(
+                        Label::new(author)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
+                    )
+                    .child(
+                        Label::new(format!(
+                            "\u{2022} #{number}{}",
+                            if is_draft { " \u{2022} Draft" } else { "" }
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .flex_none(),
+                    ),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.selected_entry = Some(index);
+                this.open_entry(index, window, cx);
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    fn render_commit_row(
+        &self,
+        index: usize,
+        commit_index: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let commit = self.pull_request_commit(index, commit_index)?;
+        let oid = commit.oid;
+        let title = commit.title.clone();
+        let author = commit.author.clone();
+        let short: SharedString = oid.to_string().chars().take(8).collect::<String>().into();
+        let is_expanded = self.commit_files.contains_key(&oid);
+
+        Some(
+            v_flex()
+                .id(("pr-commit", (index * RESULT_LIMIT) + commit_index))
+                .cursor_pointer()
+                .w_full()
+                .min_w_0()
+                .py_1()
+                .pr_2()
+                .pl_4()
+                .gap_0p5()
+                .hover(|style| style.bg(cx.theme().colors().element_hover))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            IconButton::new(
+                                (
+                                    "pr-commit-disclosure",
+                                    (index * RESULT_LIMIT) + commit_index,
+                                ),
+                                if is_expanded {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                },
+                            )
+                            .icon_size(IconSize::XSmall)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text(if is_expanded {
+                                "Hide Changed Files"
+                            } else {
+                                "Show Changed Files"
+                            }))
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle_commit_files(oid, cx);
+                                },
+                            )),
+                        )
+                        .child(Label::new(title).size(LabelSize::Small).truncate()),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .pl_4()
+                        .gap_1p5()
+                        .child(
+                            Label::new(author)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate(),
+                        )
+                        .child(
+                            Label::new(short)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .flex_none(),
+                        ),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_commit_preview(oid, None, window, cx);
+                }))
+                .into_any_element(),
+        )
+    }
+
+    fn target(&self) -> Option<GitHubRepository> {
+        self.selected_remote
+            .and_then(|index| self.remotes.get(index))
+            .map(|(_, target)| target.clone())
+    }
+
+    /// Lists the rows of the pull request list, including the commits of
+    /// expanded pull requests and the files of expanded commits.
+    fn rows(&self) -> Rc<[BrowserRow]> {
+        browser_rows(
+            &self.state.entries,
+            &self.pull_request_commits,
+            &self.commit_files,
+        )
+    }
+
+    fn row_for_pull_request(&self, index: usize) -> usize {
+        self.rows()
+            .iter()
+            .position(|row| matches!(row, BrowserRow::PullRequest { index: row_index } if *row_index == index))
+            .unwrap_or(index)
+    }
+
+    fn toggle_pull_request_commits(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(number) = self.state.entries.get(index).map(|entry| entry.number) else {
+            return;
+        };
+        if self.pull_request_commits.remove(&number).is_some() {
+            self.pull_request_commit_tasks.remove(&number);
+            cx.notify();
+            return;
+        }
+        let result = check_access(&self.project, cx)
+            .and_then(|()| self.target().context("Select a GitHub remote"));
+        let target = match result {
+            Ok(target) => target,
+            Err(error) => {
+                self.pull_request_commits.insert(
+                    number,
+                    PullRequestCommits::Error(format!("{error:#}").into()),
+                );
+                cx.notify();
+                return;
+            }
+        };
+        self.pull_request_commits
+            .insert(number, PullRequestCommits::Loading);
+        self.pull_request_commit_tasks.insert(
+            number,
+            cx.spawn(async move |this, cx| {
+                let page = cx
+                    .background_spawn(async move {
+                        GitHubPullRequestService::activity(
+                            &target,
+                            number,
+                            ActivitySection::Commits,
+                            None,
+                        )
+                        .await
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    // The row may have been collapsed, or the list reloaded, while loading.
+                    if !this.pull_request_commits.contains_key(&number) {
+                        return;
+                    }
+                    let state = match page {
+                        Ok(page) => PullRequestCommits::Loaded(
+                            page.items
+                                .iter()
+                                .filter_map(|item| match &item.kind {
+                                    ActivityKind::Commit { oid, title } => {
+                                        Some(PullRequestCommit {
+                                            oid: *oid,
+                                            title: title.clone().into(),
+                                            author: item.author.clone().into(),
+                                        })
+                                    }
+                                    _ => None,
+                                })
+                                .collect(),
+                        ),
+                        Err(error) => PullRequestCommits::Error(format!("{error:#}").into()),
+                    };
+                    this.pull_request_commits.insert(number, state);
+                    cx.notify();
+                })
+                .log_err();
+            }),
+        );
+        cx.notify();
+    }
+
+    fn toggle_commit_files(&mut self, commit: Oid, cx: &mut Context<Self>) {
+        if self.commit_files.remove(&commit).is_some() {
+            self.commit_file_tasks.remove(&commit);
+            cx.notify();
+            return;
+        }
+        let result = check_access(&self.project, cx).and_then(|()| {
+            let repository = self
+                .repository
+                .clone()
+                .context("The PR repository is no longer available")?;
+            let target = self.target().context("Select a GitHub remote")?;
+            anyhow::Ok((repository, target))
+        });
+        let (repository, target) = match result {
+            Ok(value) => value,
+            Err(error) => {
+                self.commit_files
+                    .insert(commit, CommitFileList::Error(format!("{error:#}").into()));
+                cx.notify();
+                return;
+            }
+        };
+        let source = format!("https://{}.git", target.target());
+        let response = repository.update(cx, |repository, cx| {
+            repository.fetch_pr_commit(source, commit, cx)
+        });
+        self.commit_files.insert(commit, CommitFileList::Loading);
+        self.commit_file_tasks.insert(
+            commit,
+            cx.spawn(async move |this, cx| {
+                let summaries = match response.await {
+                    Ok(diff) => {
+                        let summaries = cx
+                            .background_spawn(async move { summarize_commit_files(&diff.files) })
+                            .await;
+                        Ok(summaries)
+                    }
+                    Err(error) => Err(error),
+                };
+                this.update(cx, |this, cx| {
+                    if !this.commit_files.contains_key(&commit) {
+                        return;
+                    }
+                    let state = match summaries {
+                        Ok(summaries) => CommitFileList::Loaded(summaries.into()),
+                        Err(error) => CommitFileList::Error(format!("{error:#}").into()),
+                    };
+                    this.commit_files.insert(commit, state);
+                    cx.notify();
+                })
+                .log_err();
+            }),
+        );
+        cx.notify();
+    }
+
+    /// Opens a read-only preview of one PR commit, optionally loading a single
+    /// file first so that it appears at the top of the diff.
+    fn open_commit_preview(
+        &mut self,
+        commit: Oid,
+        reveal_file: Option<RepoPath>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let result = check_access(&self.project, cx).and_then(|()| {
+            let repository = self
+                .repository
+                .clone()
+                .context("The PR repository is no longer available")?;
+            let target = self.target().context("Select a GitHub remote")?;
+            anyhow::Ok((repository, target))
+        });
+        let (repository, target) = match result {
+            Ok(value) => value,
+            Err(error) => {
+                self.preview_error = Some(format!("{error:#}"));
+                cx.notify();
+                return;
+            }
+        };
+        let source = format!("https://{}.git", target.target());
+        let response = repository.update(cx, |repository, cx| {
+            repository.fetch_pr_commit(source, commit, cx)
+        });
+        let title: SharedString = format!("{} commit {commit}", target.slug()).into();
+        let workspace = self.workspace.clone();
+        self.preview_error = None;
+        self.preview_task = cx.spawn_in(window, async move |this, cx| {
+            let result = response.await;
+            let result = cx.update(|window, cx| {
+                let mut snapshot = result?;
+                if let Some(reveal_file) = &reveal_file
+                    && let Some(index) = snapshot
+                        .files
+                        .iter()
+                        .position(|file| &file.path == reveal_file)
+                {
+                    let file = snapshot.files.remove(index);
+                    snapshot.files.insert(0, file);
+                }
+                workspace.update(cx, |workspace, cx| {
+                    RevisionDiffView::open_snapshot(
+                        workspace,
+                        repository,
+                        snapshot,
+                        RevisionDiffMode::Direct,
+                        title,
+                        window,
+                        cx,
+                    );
+                })
+            });
+            this.update(cx, |this, cx| {
+                this.preview_error = match result {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) | Err(error) => Some(format!("{error:#}")),
+                };
+                cx.notify();
+            })
+            .log_err();
+        });
+        cx.notify();
+    }
+
     fn select(&mut self, direction: SelectionDirection, cx: &mut Context<Self>) {
         if self.state.entries.is_empty() {
             return;
@@ -411,7 +869,7 @@ impl PullRequestBrowser {
         };
         self.selected_entry = Some(index);
         self.scroll_handle
-            .scroll_to_item(index, ScrollStrategy::Top);
+            .scroll_to_item(self.row_for_pull_request(index), ScrollStrategy::Top);
         cx.notify();
     }
 }
@@ -550,70 +1008,96 @@ impl Render for PullRequestBrowser {
                         |this| this.child(Label::new("No open pull requests match this filter.")),
                     ),
             )
+            .when_some(self.preview_error.clone(), |this, error| {
+                this.child(
+                    div()
+                        .px_2()
+                        .child(Label::new(error).color(Color::Error).size(LabelSize::Small)),
+                )
+            })
             .child(
                 uniform_list(
                     "pr-list",
-                    self.state.entries.len(),
+                    self.rows().len(),
                     cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
-                        range
-                            .filter_map(|index| {
-                                let entry = this.state.entries.get(index)?;
-                                Some(
-                                    v_flex()
-                                        .id(("pr-entry", index))
-                                        .debug_selector(move || format!("pr-row-{index}"))
-                                        .cursor_pointer()
-                                        .w_full()
-                                        .min_w_0()
-                                        .py_1()
-                                        .px_2()
-                                        .gap_0p5()
-                                        .border_1()
-                                        .border_color(gpui::transparent_black())
-                                        .hover(|style| style.bg(cx.theme().colors().element_hover))
-                                        .when(this.selected_entry == Some(index), |row| {
-                                            row.border_color(
-                                                cx.theme().colors().panel_focused_border,
-                                            )
-                                        })
-                                        .child(
-                                            h_flex()
-                                                .w_full()
-                                                .min_w_0()
-                                                .child(Label::new(entry.title.clone()).truncate()),
-                                        )
-                                        .child(
-                                            h_flex()
-                                                .w_full()
-                                                .min_w_0()
-                                                .gap_1p5()
-                                                .child(
-                                                    Label::new(entry.author_login().to_owned())
-                                                        .size(LabelSize::Small)
-                                                        .color(Color::Muted)
-                                                        .truncate(),
-                                                )
-                                                .child(
-                                                    Label::new(format!(
-                                                        "• #{}{}",
-                                                        entry.number,
-                                                        if entry.is_draft {
-                                                            " • Draft"
-                                                        } else {
-                                                            ""
-                                                        }
-                                                    ))
-                                                    .size(LabelSize::Small)
-                                                    .color(Color::Muted)
-                                                    .flex_none(),
-                                                ),
-                                        )
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.selected_entry = Some(index);
-                                            this.open_entry(index, window, cx);
-                                            cx.notify();
-                                        })),
-                                )
+                        let rows = this.rows();
+                        rows.get(range.clone())
+                            .unwrap_or_default()
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(offset, row)| {
+                                let row_index = range.start + offset;
+                                match *row {
+                                    BrowserRow::PullRequest { index } => {
+                                        Some(this.render_pull_request_row(index, cx))
+                                    }
+                                    BrowserRow::PullRequestMessage { index } => {
+                                        let entry = this.state.entries.get(index)?;
+                                        let message = match this
+                                            .pull_request_commits
+                                            .get(&entry.number)?
+                                        {
+                                            PullRequestCommits::Loading => {
+                                                SharedString::new_static("Loading commits\u{2026}")
+                                            }
+                                            PullRequestCommits::Error(error) => error.clone(),
+                                            PullRequestCommits::Loaded(_) => {
+                                                SharedString::new_static("No commits")
+                                            }
+                                        };
+                                        Some(render_list_message(message, 4.))
+                                    }
+                                    BrowserRow::Commit {
+                                        index,
+                                        commit_index,
+                                    } => this.render_commit_row(index, commit_index, cx),
+                                    BrowserRow::CommitMessage {
+                                        index,
+                                        commit_index,
+                                    } => {
+                                        let commit =
+                                            this.pull_request_commit(index, commit_index)?;
+                                        let message = match this.commit_files.get(&commit.oid)? {
+                                            CommitFileList::Loading => SharedString::new_static(
+                                                "Loading changed files\u{2026}",
+                                            ),
+                                            CommitFileList::Error(error) => error.clone(),
+                                            CommitFileList::Loaded(_) => {
+                                                SharedString::new_static("No files changed")
+                                            }
+                                        };
+                                        Some(render_list_message(message, 6.))
+                                    }
+                                    BrowserRow::File {
+                                        index,
+                                        commit_index,
+                                        file_index,
+                                    } => {
+                                        let commit =
+                                            this.pull_request_commit(index, commit_index)?;
+                                        let oid = commit.oid;
+                                        let CommitFileList::Loaded(files) =
+                                            this.commit_files.get(&oid)?
+                                        else {
+                                            return None;
+                                        };
+                                        let file = files.get(file_index)?;
+                                        let path = file.path.clone();
+                                        Some(render_commit_file(
+                                            ("pr-commit-file", row_index),
+                                            file,
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.open_commit_preview(
+                                                    oid,
+                                                    Some(path.clone()),
+                                                    window,
+                                                    cx,
+                                                );
+                                            }),
+                                            cx,
+                                        ))
+                                    }
+                                }
                             })
                             .collect()
                     }),
@@ -623,6 +1107,74 @@ impl Render for PullRequestBrowser {
                 .track_scroll(&self.scroll_handle),
             )
     }
+}
+
+fn browser_rows(
+    entries: &[PullRequestSummary],
+    pull_request_commits: &HashMap<u64, PullRequestCommits>,
+    commit_files: &HashMap<Oid, CommitFileList>,
+) -> Rc<[BrowserRow]> {
+    let mut rows = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        rows.push(BrowserRow::PullRequest { index });
+        let Some(commits) = pull_request_commits.get(&entry.number) else {
+            continue;
+        };
+        let PullRequestCommits::Loaded(commits) = commits else {
+            rows.push(BrowserRow::PullRequestMessage { index });
+            continue;
+        };
+        if commits.is_empty() {
+            rows.push(BrowserRow::PullRequestMessage { index });
+            continue;
+        }
+        for (commit_index, commit) in commits.iter().enumerate() {
+            rows.push(BrowserRow::Commit {
+                index,
+                commit_index,
+            });
+            let Some(files) = commit_files.get(&commit.oid) else {
+                continue;
+            };
+            let CommitFileList::Loaded(files) = files else {
+                rows.push(BrowserRow::CommitMessage {
+                    index,
+                    commit_index,
+                });
+                continue;
+            };
+            if files.is_empty() {
+                rows.push(BrowserRow::CommitMessage {
+                    index,
+                    commit_index,
+                });
+                continue;
+            }
+            rows.extend((0..files.len()).map(|file_index| BrowserRow::File {
+                index,
+                commit_index,
+                file_index,
+            }));
+        }
+    }
+    rows.into()
+}
+
+fn render_list_message(message: SharedString, indent: f32) -> AnyElement {
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .h_full()
+        .items_center()
+        .pr_2()
+        .pl(ui::rems(indent / 4.))
+        .child(
+            Label::new(message)
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .truncate(),
+        )
+        .into_any_element()
 }
 
 struct PreviewRequest {
@@ -2236,6 +2788,94 @@ mod tests {
         browser.read_with(&cx, |browser, _| {
             assert_eq!(browser.selected_entry, Some(0))
         });
+    }
+
+    #[test]
+    fn test_pull_request_browser_rows_nest_commits_and_files() {
+        use crate::commit_file_list::CommitFileSummary;
+        use git::repository::{CommitFileStatus, RepoPath};
+        use git::status::DiffStat;
+
+        let mut state = ListState::default();
+        state.entries = serde_json::from_value(serde_json::json!([
+            {"number": 1, "title": "First", "author": {"login": "author"}, "isDraft": false},
+            {"number": 2, "title": "Second", "author": {"login": "author"}, "isDraft": false}
+        ]))
+        .expect("PR fixture");
+
+        let commit = Oid::from_bytes(&[7; 20]).expect("oid");
+        let mut pull_request_commits = HashMap::default();
+        pull_request_commits.insert(1, PullRequestCommits::Loading);
+        assert_eq!(
+            browser_rows(&state.entries, &pull_request_commits, &HashMap::default()).to_vec(),
+            vec![
+                BrowserRow::PullRequest { index: 0 },
+                BrowserRow::PullRequestMessage { index: 0 },
+                BrowserRow::PullRequest { index: 1 },
+            ],
+            "a pull request that is still loading its commits must show feedback"
+        );
+
+        pull_request_commits.insert(
+            1,
+            PullRequestCommits::Loaded(
+                vec![PullRequestCommit {
+                    oid: commit,
+                    title: "Fix".into(),
+                    author: "ada".into(),
+                }]
+                .into(),
+            ),
+        );
+        let mut commit_files = HashMap::default();
+        commit_files.insert(
+            commit,
+            CommitFileList::Loaded(
+                vec![
+                    CommitFileSummary {
+                        path: RepoPath::from_rel_path(util::rel_path::rel_path("src/main.rs")),
+                        status: CommitFileStatus::Modified,
+                        stat: DiffStat {
+                            added: 1,
+                            deleted: 1,
+                        },
+                        is_binary: false,
+                    },
+                    CommitFileSummary {
+                        path: RepoPath::from_rel_path(util::rel_path::rel_path("README.md")),
+                        status: CommitFileStatus::Added,
+                        stat: DiffStat {
+                            added: 2,
+                            deleted: 0,
+                        },
+                        is_binary: false,
+                    },
+                ]
+                .into(),
+            ),
+        );
+        assert_eq!(
+            browser_rows(&state.entries, &pull_request_commits, &commit_files).to_vec(),
+            vec![
+                BrowserRow::PullRequest { index: 0 },
+                BrowserRow::Commit {
+                    index: 0,
+                    commit_index: 0
+                },
+                BrowserRow::File {
+                    index: 0,
+                    commit_index: 0,
+                    file_index: 0
+                },
+                BrowserRow::File {
+                    index: 0,
+                    commit_index: 0,
+                    file_index: 1
+                },
+                BrowserRow::PullRequest { index: 1 },
+            ],
+            "expanded commits must list their changed files under the commit"
+        );
     }
 
     #[test]
