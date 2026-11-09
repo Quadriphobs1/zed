@@ -17,9 +17,9 @@ use git::{
 };
 use gpui::{
     AnyElement, App, AppContext as _, AsyncWindowContext, ClipboardItem, Context, Entity,
-    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
-    PromptLevel, Render, ScrollHandle, StatefulInteractiveElement as _, Styled, Task, WeakEntity,
-    Window, actions,
+    EventEmitter, FocusHandle, Focusable, Image, InteractiveElement, IntoElement, ObjectFit,
+    ParentElement, PromptLevel, Render, ScrollHandle, StatefulInteractiveElement as _, Styled,
+    Task, WeakEntity, Window, actions, img,
 };
 use language::{
     Buffer, BufferId, Capability, DiskState, File, LanguageRegistry, LineEnding,
@@ -91,7 +91,50 @@ pub struct CommitView {
     is_shallow_boundary: bool,
     file_filter: Option<RepoPath>,
     reveal_file: Option<RepoPath>,
+    /// Images cannot be diffed as text, so they are shown side by side above
+    /// the diff instead.
+    image_previews: Vec<ImagePreview>,
     _load_diff_task: Task<Result<()>>,
+}
+
+struct ImagePreview {
+    path: RepoPath,
+    before: Option<Arc<Image>>,
+    after: Option<Arc<Image>>,
+}
+
+/// Decodes the raw blobs the git store kept for image files. Unsupported or
+/// corrupt images simply have no preview.
+fn image_previews(files: &[CommitFile], filter: Option<&RepoPath>) -> Vec<ImagePreview> {
+    let decode = |bytes: Option<&Arc<[u8]>>| {
+        let bytes = bytes?;
+        let format = image::guess_format(bytes).ok()?;
+        let format = match format {
+            image::ImageFormat::Png => gpui::ImageFormat::Png,
+            image::ImageFormat::Jpeg => gpui::ImageFormat::Jpeg,
+            image::ImageFormat::WebP => gpui::ImageFormat::Webp,
+            image::ImageFormat::Gif => gpui::ImageFormat::Gif,
+            image::ImageFormat::Bmp => gpui::ImageFormat::Bmp,
+            image::ImageFormat::Tiff => gpui::ImageFormat::Tiff,
+            image::ImageFormat::Ico => gpui::ImageFormat::Ico,
+            _ => return None,
+        };
+        Some(Arc::new(Image::from_bytes(format, bytes.to_vec())))
+    };
+
+    files
+        .iter()
+        .filter(|file| filter.is_none_or(|filter| &file.path == filter))
+        .filter_map(|file| {
+            let before = decode(file.old_bytes.as_ref());
+            let after = decode(file.new_bytes.as_ref());
+            (before.is_some() || after.is_some()).then(|| ImagePreview {
+                path: file.path.clone(),
+                before,
+                after,
+            })
+        })
+        .collect()
 }
 
 pub(crate) struct GitBlob {
@@ -363,6 +406,7 @@ impl CommitView {
         let commit_view_settings = EditorSettings::get_global(cx).commit_view;
         // A view filtered to a single file is opened to look at that file, so keep it expanded.
         let collapse_files = !commit_view_settings.expand_files && file_filter.is_none();
+        let image_previews = image_previews(&files, file_filter.as_ref());
 
         let load_diff_task = cx.spawn_in(window, async move |this, cx| {
             let mut folded_buffer_ids: HashSet<language::BufferId> = HashSet::default();
@@ -474,6 +518,7 @@ impl CommitView {
             is_shallow_boundary,
             file_filter,
             reveal_file,
+            image_previews,
             _load_diff_task: load_diff_task,
         }
     }
@@ -846,6 +891,57 @@ impl CommitView {
             return;
         };
         self.open_file_at_head(&file, window, cx);
+    }
+
+    fn render_image_previews(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        if self.image_previews.is_empty() {
+            return None;
+        }
+        let render_side = |label: &'static str, image: Option<&Arc<Image>>| {
+            v_flex()
+                .gap_1()
+                .min_w_0()
+                .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+                .child(match image {
+                    Some(image) => img(image.clone())
+                        .object_fit(ObjectFit::ScaleDown)
+                        .max_h(px(220.))
+                        .max_w(px(320.))
+                        .into_any_element(),
+                    None => Label::new("absent").color(Color::Muted).into_any_element(),
+                })
+        };
+
+        Some(
+            v_flex()
+                .id("commit-image-previews")
+                .flex_none()
+                .w_full()
+                .max_h(px(520.))
+                .overflow_y_scroll()
+                .p_3()
+                .gap_3()
+                .border_b_1()
+                .border_color(cx.theme().colors().border)
+                .children(self.image_previews.iter().map(|preview| {
+                    v_flex()
+                        .gap_1p5()
+                        .min_w_0()
+                        .child(
+                            Label::new(preview.path.as_unix_str().to_string())
+                                .size(LabelSize::Small)
+                                .truncate(),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_4()
+                                .items_start()
+                                .child(render_side("Before", preview.before.as_ref()))
+                                .child(render_side("After", preview.after.as_ref())),
+                        )
+                }))
+                .into_any_element(),
+        )
     }
 
     fn render_header(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1519,6 +1615,15 @@ impl Item for CommitView {
                 is_shallow_boundary: self.is_shallow_boundary,
                 file_filter: self.file_filter.clone(),
                 reveal_file: self.reveal_file.clone(),
+                image_previews: self
+                    .image_previews
+                    .iter()
+                    .map(|preview| ImagePreview {
+                        path: preview.path.clone(),
+                        before: preview.before.clone(),
+                        after: preview.after.clone(),
+                    })
+                    .collect(),
                 _load_diff_task: Task::ready(Ok(())),
             }
         })))
@@ -1535,6 +1640,7 @@ impl Render for CommitView {
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(self.render_header(window, cx))
+            .children(self.render_image_previews(cx))
             .when(
                 !self.editor.read(cx).rhs_editor().read(cx).is_empty(cx),
                 |this| this.child(div().flex_grow(1.).child(self.editor.clone())),
@@ -2012,6 +2118,8 @@ mod tests {
                 old_text: Some(old_text),
                 new_text: Some(new_text),
                 is_binary: false,
+                old_bytes: None,
+                new_bytes: None,
             }
         };
 
