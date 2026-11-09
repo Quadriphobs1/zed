@@ -7064,6 +7064,7 @@ dependencies = [
  "git_hosting_providers",
  "git_ui_core",
  "gpui",
+ "image",
  "indoc",
  "itertools 0.14.0",
  "language",

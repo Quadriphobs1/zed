@@ -1840,6 +1840,8 @@ mod tests {
                     old_text: Some(format!("{path} old\n")),
                     new_text: Some(format!("{path} new\n")),
                     is_binary: false,
+                    old_bytes: None,
+                    new_bytes: None,
                 })
                 .into(),
             is_shallow_boundary: false,
