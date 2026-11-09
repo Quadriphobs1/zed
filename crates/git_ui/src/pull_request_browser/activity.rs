@@ -1210,6 +1210,8 @@ mod tests {
                 old_text: None,
                 new_text: Some("root content\n".into()),
                 is_binary: false,
+                old_bytes: None,
+                new_bytes: None,
             }],
         }
     }

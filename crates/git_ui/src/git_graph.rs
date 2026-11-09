@@ -8602,6 +8602,8 @@ mod tests {
                     old_text: Some("content".into()),
                     new_text: Some("updated content".into()),
                     is_binary: false,
+                    old_bytes: None,
+                    new_bytes: None,
                 }],
                 is_shallow_boundary: false,
             });

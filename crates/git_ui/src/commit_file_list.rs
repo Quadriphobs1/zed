@@ -151,6 +151,8 @@ mod tests {
             old_text: old_text.map(str::to_string),
             new_text: new_text.map(str::to_string),
             is_binary: false,
+            old_bytes: None,
+            new_bytes: None,
         }
     }
 

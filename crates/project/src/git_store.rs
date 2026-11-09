@@ -251,6 +251,11 @@ pub struct CommitFile {
     pub old_text: Option<String>,
     pub new_text: Option<String>,
     pub is_binary: bool,
+    /// Raw contents of binary files that can be displayed instead of diffed,
+    /// currently images. Absent for text files, oversized blobs, and remote
+    /// repositories, which only transfer text.
+    pub old_bytes: Option<Arc<[u8]>>,
+    pub new_bytes: Option<Arc<[u8]>>,
 }
 
 impl CommitFile {
@@ -261,6 +266,18 @@ impl CommitFile {
             _ => CommitFileStatus::Modified,
         }
     }
+}
+
+/// Images larger than this are not previewed; the diff would carry the bytes
+/// around for a picture that is too big to be useful inline anyway.
+const MAX_IMAGE_PREVIEW_BYTES: usize = 8 * 1024 * 1024;
+
+fn is_image_path(path: &RepoPath) -> bool {
+    path.extension().is_some_and(|extension| {
+        let extension = extension.to_lowercase();
+        // SVG is text, so it diffs normally and is never previewed here.
+        gpui::Img::extensions().contains(&extension.as_str()) && extension != "svg"
+    })
 }
 
 fn decode_commit_diff(diff: git::repository::CommitDiff) -> CommitDiff {
@@ -276,11 +293,21 @@ fn decode_commit_diff(diff: git::repository::CommitDiff) -> CommitDiff {
             } = file;
 
             if is_binary {
+                let keep_image_bytes = |content: Option<Vec<u8>>| {
+                    content.map(|content| {
+                        let keep = is_image_path(&path) && content.len() <= MAX_IMAGE_PREVIEW_BYTES;
+                        (keep.then(|| Arc::from(content.as_slice())), String::new())
+                    })
+                };
+                let old = keep_image_bytes(old_content);
+                let new = keep_image_bytes(new_content);
                 return CommitFile {
                     path,
-                    old_text: old_content.map(|_| String::new()),
-                    new_text: new_content.map(|_| String::new()),
+                    old_text: old.as_ref().map(|(_, text)| text.clone()),
+                    new_text: new.as_ref().map(|(_, text)| text.clone()),
                     is_binary,
+                    old_bytes: old.and_then(|(bytes, _)| bytes),
+                    new_bytes: new.and_then(|(bytes, _)| bytes),
                 };
             }
 
@@ -309,6 +336,8 @@ fn decode_commit_diff(diff: git::repository::CommitDiff) -> CommitDiff {
                 old_text,
                 new_text,
                 is_binary,
+                old_bytes: None,
+                new_bytes: None,
             }
         })
         .collect();
@@ -7313,6 +7342,8 @@ impl Repository {
                                     old_text: file.old_text,
                                     new_text: file.new_text,
                                     is_binary: file.is_binary,
+                                    old_bytes: None,
+                                    new_bytes: None,
                                 })
                             })
                             .collect::<Result<Vec<_>>>()?,
@@ -11587,6 +11618,53 @@ mod tests {
     use serde_json::json;
     use settings::SettingsStore;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn test_decode_commit_diff_keeps_image_bytes() {
+        let png = b"\x89PNG\r\n\x1a\nfake".to_vec();
+        let binary = vec![0_u8, 1, 2, 3];
+        let diff = decode_commit_diff(git::repository::CommitDiff {
+            files: vec![
+                git::repository::CommitFile {
+                    path: repo_path("art/cover.jpg"),
+                    old_content: Some(png.clone()),
+                    new_content: Some(png.clone()),
+                    is_binary: true,
+                },
+                git::repository::CommitFile {
+                    path: repo_path("art/icon.svg"),
+                    old_content: None,
+                    new_content: Some(png),
+                    is_binary: true,
+                },
+                git::repository::CommitFile {
+                    path: repo_path("bin/tool"),
+                    old_content: None,
+                    new_content: Some(binary),
+                    is_binary: true,
+                },
+                git::repository::CommitFile {
+                    path: repo_path("src/main.rs"),
+                    old_content: None,
+                    new_content: Some(b"fn main() {}".to_vec()),
+                    is_binary: false,
+                },
+            ],
+            is_shallow_boundary: false,
+        });
+
+        let bytes = |index: usize| {
+            (
+                diff.files[index].old_bytes.is_some(),
+                diff.files[index].new_bytes.is_some(),
+            )
+        };
+        assert_eq!(bytes(0), (true, true), "images keep both sides");
+        assert_eq!(bytes(1), (false, false), "SVG is text, not a preview");
+        assert_eq!(bytes(2), (false, false), "other binaries stay opaque");
+        assert_eq!(bytes(3), (false, false), "text files carry no bytes");
+        assert_eq!(diff.files[3].new_text.as_deref(), Some("fn main() {}"));
+    }
 
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
