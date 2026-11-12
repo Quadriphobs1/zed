@@ -5,6 +5,7 @@ use git::status::{DiffStat, FileStatus, StatusCode, TrackedStatus};
 use gpui::{AnyElement, App, ClickEvent, ElementId, SharedString, Window};
 use project::git_store::CommitFile;
 use ui::{Color, Label, LabelSize, prelude::*};
+use util::ResultExt as _;
 
 use crate::git_status_icon;
 
@@ -138,6 +139,110 @@ fn render_diff_stat(file: &CommitFileSummary) -> AnyElement {
                 .color(Color::Deleted),
         )
         .into_any_element()
+}
+
+/// A dropdown listing the files one commit changed, for commit lists that
+/// cannot grow rows inline (such as the graph table, whose row heights are
+/// pinned to the lane canvas).
+pub(crate) struct CommitFilesPopover {
+    files: CommitFileList,
+    focus_handle: gpui::FocusHandle,
+    on_open_file: Rc<dyn Fn(RepoPath, &mut Window, &mut App)>,
+    _load_task: gpui::Task<()>,
+}
+
+impl CommitFilesPopover {
+    pub(crate) fn new(
+        repository: gpui::Entity<project::git_store::Repository>,
+        sha: git::Oid,
+        on_open_file: Rc<dyn Fn(RepoPath, &mut Window, &mut App)>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let diff = repository.update(cx, |repository, cx| {
+            repository.load_commit_diff(sha.to_string(), false, cx)
+        });
+        let load_task = cx.spawn(async move |this, cx| {
+            let files = match diff.await {
+                Ok(diff) => {
+                    let summaries = cx
+                        .background_spawn(async move { summarize_commit_files(&diff.files) })
+                        .await;
+                    CommitFileList::Loaded(summaries.into())
+                }
+                Err(error) => CommitFileList::Error(format!("{error:#}").into()),
+            };
+            this.update(cx, |this, cx| {
+                this.files = files;
+                cx.notify();
+            })
+            .log_err();
+        });
+
+        Self {
+            files: CommitFileList::Loading,
+            focus_handle: cx.focus_handle(),
+            on_open_file,
+            _load_task: load_task,
+        }
+    }
+}
+
+impl gpui::EventEmitter<gpui::DismissEvent> for CommitFilesPopover {}
+
+impl gpui::Focusable for CommitFilesPopover {
+    fn focus_handle(&self, _: &App) -> gpui::FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for CommitFilesPopover {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let message = match &self.files {
+            CommitFileList::Loading => {
+                Some(SharedString::new_static("Loading changed files\u{2026}"))
+            }
+            CommitFileList::Error(error) => Some(error.clone()),
+            CommitFileList::Loaded(files) if files.is_empty() => {
+                Some(SharedString::new_static("No files changed"))
+            }
+            CommitFileList::Loaded(_) => None,
+        };
+
+        ui::Popover::new().child(
+            v_flex()
+                .id("commit-files-popover")
+                .track_focus(&self.focus_handle)
+                .min_w(ui::px(320.))
+                .max_w(ui::px(560.))
+                .max_h(ui::px(400.))
+                .overflow_y_scroll()
+                .py_1()
+                .when_some(message, |this, message| {
+                    this.child(
+                        div().px_2().py_1().child(
+                            Label::new(message)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                    )
+                })
+                .map(|this| {
+                    let CommitFileList::Loaded(files) = &self.files else {
+                        return this;
+                    };
+                    this.children(files.iter().enumerate().map(|(index, file)| {
+                        let path = file.path.clone();
+                        let on_open_file = self.on_open_file.clone();
+                        render_commit_file(
+                            ("commit-files-popover-file", index),
+                            file,
+                            move |_, window, cx| on_open_file(path.clone(), window, cx),
+                            cx,
+                        )
+                    }))
+                }),
+        )
+    }
 }
 
 #[cfg(test)]
