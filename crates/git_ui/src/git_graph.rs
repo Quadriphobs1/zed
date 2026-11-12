@@ -4,6 +4,7 @@ use crate::{
         CUSTOM_GIT_COMMANDS_DOCS_SLUG, CommitContextMenuData, CommitContextMenuSource,
         commit_context_menu, git_context_menu_tasks, git_task_context,
     },
+    commit_file_list::CommitFilesPopover,
     commit_tooltip::CommitAvatar,
     commit_view::{CommitView, CommitViewOptions},
     git_status_icon,
@@ -58,10 +59,11 @@ use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
 use ui::{
     Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, ContextMenuEntry, DiffStat,
     Disclosure, Divider, HeaderResizeInfo, HighlightedLabel, IndentGuideColors, ListItem,
-    ListItemSpacing, RedistributableColumnsState, ScrollableHandle, Table, TableInteractionState,
-    TableRenderContext, TableResizeBehavior, Tooltip, WithScrollbar, bind_redistributable_columns,
-    prelude::*, redistribute_hidden_fractions, redistribute_hidden_widths,
-    render_redistributable_columns_resize_handles, render_table_header, table_row::TableRow,
+    ListItemSpacing, PopoverMenu, RedistributableColumnsState, ScrollableHandle, Table,
+    TableInteractionState, TableRenderContext, TableResizeBehavior, Tooltip, WithScrollbar,
+    bind_redistributable_columns, prelude::*, redistribute_hidden_fractions,
+    redistribute_hidden_widths, render_redistributable_columns_resize_handles, render_table_header,
+    table_row::TableRow,
 };
 use util::{ResultExt, debug_panic};
 use workspace::{
@@ -2147,11 +2149,59 @@ impl GitGraph {
                     column_label(subject)
                 };
 
+                let files_popover = {
+                    let repository = repository.clone();
+                    let workspace = self.workspace.clone();
+                    let sha = commit.data.sha;
+                    PopoverMenu::new(ElementId::NamedInteger(
+                        "commit-files-menu".into(),
+                        idx as u64,
+                    ))
+                    .trigger(
+                        IconButton::new(
+                            ElementId::NamedInteger("commit-files-toggle".into(), idx as u64),
+                            IconName::ChevronRight,
+                        )
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Show Changed Files")),
+                    )
+                    .anchor(gpui::Anchor::TopLeft)
+                    .menu(move |_, cx| {
+                        let repository = repository.clone();
+                        let open_repository = repository.downgrade();
+                        let workspace = workspace.clone();
+                        let on_open_file =
+                            Rc::new(move |path: RepoPath, window: &mut Window, cx: &mut App| {
+                                CommitView::open(
+                                    sha.to_string(),
+                                    open_repository.clone(),
+                                    workspace.clone(),
+                                    CommitViewOptions {
+                                        reveal_file: Some(path),
+                                        ..Default::default()
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            });
+                        Some(
+                            cx.new(|cx| CommitFilesPopover::new(repository, sha, on_open_file, cx)),
+                        )
+                    })
+                };
+
                 vec![
                     div()
                         .id(ElementId::NamedInteger("commit-subject".into(), idx as u64))
                         .overflow_hidden()
-                        .child(h_flex().gap_2().overflow_hidden().child(subject_label))
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .overflow_hidden()
+                                .child(files_popover)
+                                .child(subject_label),
+                        )
                         .into_any_element(),
                     column_label(formatted_time.into()),
                     {
