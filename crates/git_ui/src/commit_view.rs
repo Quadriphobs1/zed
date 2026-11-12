@@ -1,3 +1,4 @@
+use crate::change_overview::{ChangeOverview, build_change_overview, narrate_overview};
 use anyhow::{Context as _, Result};
 use buffer_diff::BufferDiff;
 use collections::HashMap;
@@ -25,7 +26,7 @@ use language::{
     Buffer, BufferId, Capability, DiskState, File, LanguageRegistry, LineEnding,
     OffsetRangeExt as _, ReplicaId, Rope, TextBuffer,
 };
-use markdown::{Markdown, MarkdownElement, MarkdownStyle};
+use markdown::{Markdown, MarkdownElement, MarkdownOptions, MarkdownStyle};
 use multi_buffer::PathKey;
 use project::{
     Project, ProjectPath, WorktreeId,
@@ -94,6 +95,16 @@ pub struct CommitView {
     /// Images cannot be diffed as text, so they are shown side by side above
     /// the diff instead.
     image_previews: Vec<ImagePreview>,
+    /// A code-free picture of the commit, built on request.
+    show_overview: bool,
+    overview: Option<Entity<Markdown>>,
+    overview_narration: Option<Entity<Markdown>>,
+    overview_summary: Option<ChangeOverview>,
+    overview_error: Option<SharedString>,
+    overview_loading: bool,
+    overview_narrating: bool,
+    overview_task: Task<()>,
+    overview_scroll_handle: ScrollHandle,
     _load_diff_task: Task<Result<()>>,
 }
 
@@ -519,6 +530,15 @@ impl CommitView {
             file_filter,
             reveal_file,
             image_previews,
+            show_overview: false,
+            overview: None,
+            overview_narration: None,
+            overview_summary: None,
+            overview_error: None,
+            overview_loading: false,
+            overview_narrating: false,
+            overview_task: Task::ready(()),
+            overview_scroll_handle: ScrollHandle::new(),
             _load_diff_task: load_diff_task,
         }
     }
@@ -1064,6 +1084,14 @@ impl CommitView {
                                     ),
                             ),
                     )
+                    .child(
+                        Button::new("commit-overview-toggle", "Overview")
+                            .toggle_state(self.show_overview)
+                            .tooltip(Tooltip::text(
+                                "Show which files and symbols this commit touches",
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_overview(cx))),
+                    )
                     .when(self.stash.is_none(), |this| {
                         this.child(
                             Button::new("sha", "Commit SHA")
@@ -1093,6 +1121,154 @@ impl CommitView {
                     }),
             )
             .children(self.render_commit_message(avatar_container_width, window, cx))
+    }
+
+    fn toggle_overview(&mut self, cx: &mut Context<Self>) {
+        self.show_overview = !self.show_overview;
+        if self.show_overview && self.overview.is_none() && !self.overview_loading {
+            self.build_overview(cx);
+        }
+        cx.notify();
+    }
+
+    /// Reloads the commit diff rather than holding its contents alive for the
+    /// lifetime of the view; the overview is rarely opened.
+    fn build_overview(&mut self, cx: &mut Context<Self>) {
+        let commit_sha = self.commit.sha.to_string();
+        let title: SharedString = format!(
+            "{} {}",
+            self.commit.short_sha(),
+            self.commit.message.lines().next().unwrap_or_default()
+        )
+        .into();
+        let diff = self.repository.update(cx, |repository, cx| {
+            repository.load_commit_diff(commit_sha, false, cx)
+        });
+        let languages = self.project.read(cx).languages().clone();
+        let file_filter = self.file_filter.clone();
+
+        self.overview_error = None;
+        self.overview_loading = true;
+        self.overview_narration = None;
+        self.overview_task = cx.spawn(async move |this, cx| {
+            let overview = match diff.await {
+                Ok(mut diff) => {
+                    if let Some(filter) = &file_filter {
+                        diff.files.retain(|file| &file.path == filter);
+                    }
+                    cx.update(|cx| {
+                        build_change_overview(title, diff.files, Vec::new(), Some(languages), cx)
+                    })
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            this.update(cx, |this, cx| {
+                this.overview_loading = false;
+                match overview {
+                    Ok(overview) => {
+                        this.overview = Some(this.overview_markdown(overview.to_markdown(), cx));
+                        this.overview_summary = Some(overview);
+                    }
+                    Err(error) => this.overview_error = Some(format!("{error:#}").into()),
+                }
+                cx.notify();
+            })
+            .log_err();
+        });
+        cx.notify();
+    }
+
+    fn narrate_overview(&mut self, cx: &mut Context<Self>) {
+        let Some(overview) = self.overview_summary.clone() else {
+            return;
+        };
+        let narration = narrate_overview(&overview, cx);
+        self.overview_error = None;
+        self.overview_narrating = true;
+        self.overview_task = cx.spawn(async move |this, cx| {
+            let narration = narration.await;
+            this.update(cx, |this, cx| {
+                this.overview_narrating = false;
+                match narration {
+                    Ok(narration) => {
+                        this.overview_narration = Some(this.overview_markdown(narration, cx))
+                    }
+                    Err(error) => this.overview_error = Some(format!("{error:#}").into()),
+                }
+                cx.notify();
+            })
+            .log_err();
+        });
+        cx.notify();
+    }
+
+    fn overview_markdown(&self, source: String, cx: &mut Context<Self>) -> Entity<Markdown> {
+        let languages = self.project.read(cx).languages().clone();
+        cx.new(|cx| {
+            Markdown::new_with_options(
+                source.into(),
+                Some(languages),
+                None,
+                MarkdownOptions {
+                    render_mermaid_diagrams: true,
+                    ..Default::default()
+                },
+                cx,
+            )
+        })
+    }
+
+    fn render_overview(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let render_markdown = |markdown: &Entity<Markdown>, window: &mut Window, cx: &mut App| {
+            MarkdownElement::new(
+                markdown.clone(),
+                MarkdownStyle::themed(markdown::MarkdownFont::Preview, window, cx),
+            )
+            .scroll_handle(self.overview_scroll_handle.clone())
+            .into_any_element()
+        };
+
+        v_flex()
+            .id("commit-overview")
+            .debug_selector(|| "commit-overview".into())
+            .flex_grow(1.)
+            .w_full()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.overview_scroll_handle)
+            .p_4()
+            .gap_3()
+            .child(
+                h_flex().gap_1().flex_wrap().child(
+                    Button::new("commit-overview-narrate", "Explain with AI")
+                        .disabled(
+                            self.overview_summary.is_none()
+                                || self.overview_narrating
+                                || self.overview_loading,
+                        )
+                        .tooltip(Tooltip::text(
+                            "Sends only the file and symbol structure, never the code, to the configured model",
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| this.narrate_overview(cx))),
+                ),
+            )
+            .when(self.overview_loading, |this| {
+                this.child(Label::new("Building overview…").color(Color::Muted))
+            })
+            .when(self.overview_narrating, |this| {
+                this.child(Label::new("Explaining changes…").color(Color::Muted))
+            })
+            .when_some(self.overview_error.clone(), |this, error| {
+                this.child(Label::new(error).color(Color::Error))
+            })
+            .when_some(self.overview.clone(), |this, markdown| {
+                this.child(render_markdown(&markdown, window, cx))
+            })
+            .when_some(self.overview_narration.clone(), |this, markdown| {
+                this.child(render_markdown(&markdown, window, cx))
+            })
+            .into_any_element()
     }
 
     fn render_commit_message(
@@ -1624,6 +1800,15 @@ impl Item for CommitView {
                         after: preview.after.clone(),
                     })
                     .collect(),
+                show_overview: false,
+                overview: None,
+                overview_narration: None,
+                overview_summary: None,
+                overview_error: None,
+                overview_loading: false,
+                overview_narrating: false,
+                overview_task: Task::ready(()),
+                overview_scroll_handle: ScrollHandle::new(),
                 _load_diff_task: Task::ready(Ok(())),
             }
         })))
@@ -1640,11 +1825,16 @@ impl Render for CommitView {
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(self.render_header(window, cx))
-            .children(self.render_image_previews(cx))
-            .when(
-                !self.editor.read(cx).rhs_editor().read(cx).is_empty(cx),
-                |this| this.child(div().flex_grow(1.).child(self.editor.clone())),
-            )
+            .map(|this| {
+                if self.show_overview {
+                    this.child(self.render_overview(window, cx))
+                } else {
+                    this.children(self.render_image_previews(cx)).when(
+                        !self.editor.read(cx).rhs_editor().read(cx).is_empty(cx),
+                        |this| this.child(div().flex_grow(1.).child(self.editor.clone())),
+                    )
+                }
+            })
             .when(self.is_shallow_boundary, |this| {
                 this.child(self.render_shallow_boundary_notice(cx))
             })
@@ -1895,6 +2085,41 @@ mod tests {
         commit_view.read_with(cx, |commit_view, cx| {
             assert!(!commit_view.message_expanded);
             assert_eq!(folded_files(commit_view, cx), 0);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_commit_view_overview_is_built_on_demand(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (commit_view, cx) = open_test_commit_view(None, cx).await;
+
+        commit_view.read_with(cx, |commit_view, _| {
+            assert!(!commit_view.show_overview);
+            assert!(
+                commit_view.overview.is_none(),
+                "an overview must not be built before it is shown"
+            );
+        });
+
+        commit_view.update(cx, |commit_view, cx| commit_view.toggle_overview(cx));
+        cx.run_until_parked();
+        commit_view.read_with(cx, |commit_view, _| {
+            assert!(commit_view.show_overview);
+            assert!(!commit_view.overview_loading);
+            assert!(
+                commit_view.overview_summary.is_some(),
+                "showing the overview must build it: {:?}",
+                commit_view.overview_error
+            );
+        });
+
+        commit_view.update(cx, |commit_view, cx| commit_view.toggle_overview(cx));
+        commit_view.read_with(cx, |commit_view, _| {
+            assert!(!commit_view.show_overview);
+            assert!(
+                commit_view.overview_summary.is_some(),
+                "a built overview survives hiding it"
+            );
         });
     }
 
