@@ -2102,6 +2102,7 @@ impl GitGraph {
                     author_email = None;
                 }
 
+                let popover_subject = subject.clone();
                 let is_selected = self.selected_entry_idx == Some(idx);
                 let is_matched = self.search_state.matches.contains(&commit.data.sha);
                 let column_label = |label: SharedString| {
@@ -2153,6 +2154,8 @@ impl GitGraph {
                     let repository = repository.clone();
                     let workspace = self.workspace.clone();
                     let sha = commit.data.sha;
+                    let popover_title: SharedString =
+                        format!("{} {}", short_sha, popover_subject).into();
                     PopoverMenu::new(ElementId::NamedInteger(
                         "commit-files-menu".into(),
                         idx as u64,
@@ -2167,6 +2170,7 @@ impl GitGraph {
                         .tooltip(Tooltip::text("Show Changed Files")),
                     )
                     .anchor(gpui::Anchor::TopLeft)
+                    .offset(gpui::point(px(0.), px(4.)))
                     .menu(move |_, cx| {
                         let repository = repository.clone();
                         let open_repository = repository.downgrade();
@@ -2185,9 +2189,15 @@ impl GitGraph {
                                     cx,
                                 );
                             });
-                        Some(
-                            cx.new(|cx| CommitFilesPopover::new(repository, sha, on_open_file, cx)),
-                        )
+                        Some(cx.new(|cx| {
+                            CommitFilesPopover::new(
+                                repository,
+                                sha,
+                                popover_title.clone(),
+                                on_open_file,
+                                cx,
+                            )
+                        }))
                     })
                 };
 
