@@ -693,6 +693,36 @@ enum HistoryRow {
     FilesMessage {
         index: usize,
     },
+    /// Marks where the upstream branch's tip sits: commits above it have not
+    /// been pushed yet.
+    UpstreamTip,
+}
+
+/// How the checked-out branch relates to the branch it tracks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HistoryUpstream {
+    /// The tracked branch, as it is displayed (for example `origin/main`).
+    name: SharedString,
+    ahead: usize,
+    behind: usize,
+}
+
+/// Separates commits that still need pushing from those the upstream already has.
+fn render_upstream_tip(upstream_name: SharedString, cx: &App) -> AnyElement {
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .px_2()
+        .py_1()
+        .gap_1p5()
+        .child(
+            Label::new(upstream_name)
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .flex_none(),
+        )
+        .child(div().h_px().flex_1().bg(cx.theme().colors().border_variant))
+        .into_any_element()
 }
 
 /// Discarding only unstaged changes leaves the index alone, so such an op says
@@ -1400,6 +1430,9 @@ pub struct GitPanel {
     commit_history_list: ListState,
     commit_history_rows: Rc<[HistoryRow]>,
     commit_history: CommitHistory,
+    /// How the checked-out branch compares with the branch it tracks, used to
+    /// mark which commits in the History tab still need pushing.
+    history_upstream: Option<HistoryUpstream>,
     /// Changed files for commits whose history rows are expanded.
     history_commit_files: HashMap<Oid, CommitFileList>,
     history_commit_file_tasks: HashMap<Oid, Task<()>>,
@@ -1779,6 +1812,7 @@ impl GitPanel {
                 commit_history_list: ListState::new(0, ListAlignment::Top, px(400.)),
                 commit_history_rows: Rc::from([]),
                 commit_history: CommitHistory::Loading,
+                history_upstream: None,
                 history_commit_files: HashMap::default(),
                 history_commit_file_tasks: HashMap::default(),
                 focused_history_entry: None,
@@ -7885,27 +7919,74 @@ impl GitPanel {
     }
 
     fn render_history_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex().flex_1().size_full().overflow_hidden().map(|this| {
-            let has_repo = self.active_repository.is_some();
-            match &self.commit_history {
-                _ if !has_repo => {
-                    this.child(Self::render_history_placeholder("No repository found"))
+        v_flex()
+            .flex_1()
+            .size_full()
+            .overflow_hidden()
+            .children(self.render_history_sync_state(cx))
+            .map(|this| {
+                let has_repo = self.active_repository.is_some();
+                match &self.commit_history {
+                    _ if !has_repo => {
+                        this.child(Self::render_history_placeholder("No repository found"))
+                    }
+                    CommitHistory::Error(_) => this.child(Self::render_history_placeholder(
+                        "Failed to load commit history",
+                    )),
+                    CommitHistory::Loading => {
+                        this.child(Self::render_history_placeholder("Loading Commit History…"))
+                    }
+                    CommitHistory::Loaded(entries) if entries.is_empty() => {
+                        this.child(Self::render_history_placeholder("No commits yet"))
+                    }
+                    CommitHistory::Loaded(_) => match self.render_commit_history(window, cx) {
+                        Some(history) => this.child(history),
+                        None => {
+                            this.child(Self::render_history_placeholder("Failed to load commits"))
+                        }
+                    },
                 }
-                CommitHistory::Error(_) => this.child(Self::render_history_placeholder(
-                    "Failed to load commit history",
-                )),
-                CommitHistory::Loading => {
-                    this.child(Self::render_history_placeholder("Loading Commit History…"))
-                }
-                CommitHistory::Loaded(entries) if entries.is_empty() => {
-                    this.child(Self::render_history_placeholder("No commits yet"))
-                }
-                CommitHistory::Loaded(_) => match self.render_commit_history(window, cx) {
-                    Some(history) => this.child(history),
-                    None => this.child(Self::render_history_placeholder("Failed to load commits")),
-                },
-            }
-        })
+            })
+    }
+
+    /// Summarizes how far the checked-out branch has drifted from the branch it
+    /// tracks, so the History tab says how much is still unreviewed remotely.
+    fn render_history_sync_state(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let upstream = self.history_upstream.as_ref()?;
+        let summary: SharedString = match (upstream.ahead, upstream.behind) {
+            (0, 0) => format!("Up to date with {}", upstream.name).into(),
+            (ahead, 0) => format!("{ahead} to push to {}", upstream.name).into(),
+            (0, behind) => format!("{behind} to pull from {}", upstream.name).into(),
+            (ahead, behind) => format!(
+                "{ahead} to push, {behind} to pull \u{2022} {}",
+                upstream.name
+            )
+            .into(),
+        };
+
+        Some(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .px_2()
+                .py_1()
+                .gap_1p5()
+                .border_b_1()
+                .border_color(cx.theme().colors().border_variant)
+                .when(upstream.ahead > 0, |this| {
+                    this.child(Icon::new(IconName::ArrowUp).size(IconSize::XSmall))
+                })
+                .when(upstream.behind > 0, |this| {
+                    this.child(Icon::new(IconName::ArrowDown).size(IconSize::XSmall))
+                })
+                .child(
+                    Label::new(summary)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .truncate(),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_history_placeholder(message: &'static str) -> impl IntoElement {
@@ -8053,6 +8134,24 @@ impl GitPanel {
         cx.notify();
     }
 
+    fn update_history_upstream(&mut self, cx: &App) {
+        self.history_upstream = maybe!({
+            let branch = self.active_repository.as_ref()?.read(cx).branch.as_ref()?;
+            let upstream = branch.upstream.as_ref()?;
+            let tracking = upstream.tracking.status();
+            let name = upstream
+                .ref_name
+                .strip_prefix("refs/remotes/")
+                .unwrap_or(&upstream.ref_name)
+                .to_string();
+            Some(HistoryUpstream {
+                name: name.into(),
+                ahead: tracking.map_or(0, |status| status.ahead as usize),
+                behind: tracking.map_or(0, |status| status.behind as usize),
+            })
+        });
+    }
+
     /// Recomputes the History rows and tells the list which ones changed, so
     /// that scroll position and measurements of unchanged rows survive.
     fn refresh_history_rows(&mut self) {
@@ -8090,8 +8189,19 @@ impl GitPanel {
     }
 
     fn history_rows(&self) -> Rc<[HistoryRow]> {
+        let entries = self.commit_history_entries();
+        // Commits are newest first, so the upstream tip sits right after the
+        // commits that have not been pushed.
+        let upstream_tip = self
+            .history_upstream
+            .as_ref()
+            .map(|upstream| upstream.ahead)
+            .filter(|ahead| *ahead > 0 && *ahead < entries.len());
         let mut rows = Vec::new();
-        for (index, entry) in self.commit_history_entries().iter().enumerate() {
+        for (index, entry) in entries.iter().enumerate() {
+            if upstream_tip == Some(index) {
+                rows.push(HistoryRow::UpstreamTip);
+            }
             rows.push(HistoryRow::Commit { index });
             let Some(CommitFileList::Loaded(files)) = self.history_commit_files.get(&entry.sha)
             else {
@@ -8306,6 +8416,7 @@ impl GitPanel {
             .or_else(|| self.active_history_entry_index());
         self.focused_history_entry =
             focused.and_then(|focused| (count > 0).then(|| focused.min(count - 1)));
+        self.update_history_upstream(cx);
         self.refresh_history_rows();
         if changed {
             cx.notify();
@@ -8373,6 +8484,11 @@ impl GitPanel {
             })
             .collect();
         let remote = self.git_remote(cx);
+        let upstream_name = self
+            .history_upstream
+            .as_ref()
+            .map(|upstream| upstream.name.clone())
+            .unwrap_or_else(|| SharedString::new_static("upstream"));
 
         let focused_history_entry = self.focused_history_entry;
         let active_history_sha = self.active_history_sha;
@@ -8438,12 +8554,18 @@ impl GitPanel {
                                     HistoryRow::Commit { index }
                                     | HistoryRow::File { index, .. }
                                     | HistoryRow::FilesMessage { index } => index,
+                                    HistoryRow::UpstreamTip => {
+                                        elements
+                                            .push(render_upstream_tip(upstream_name.clone(), cx));
+                                        continue;
+                                    }
                                 };
                                 let Some(entry) = entries.get(index) else {
                                     continue;
                                 };
 
                                 match row {
+                                    HistoryRow::UpstreamTip => continue,
                                     HistoryRow::File { file_index, .. } => {
                                         let Some(file) = expanded_files
                                             .get(&entry.sha)

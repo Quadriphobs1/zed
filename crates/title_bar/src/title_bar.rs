@@ -943,10 +943,23 @@ impl TitleBar {
     ) -> Option<AnyElement> {
         let workspace = self.workspace.upgrade()?;
 
-        let (branch_name, icon_info, is_detached_head) = {
+        let (branch_name, icon_info, is_detached_head, upstream_state) = {
             let repo = repository.read(cx);
 
             let is_detached_head = repo.branch.is_none();
+
+            // Ahead/behind counts say how far the branch has drifted from the
+            // branch it tracks, which is what a review is measured against.
+            let upstream_state = repo.branch.as_ref().and_then(|branch| {
+                let upstream = branch.upstream.as_ref()?;
+                let tracking = upstream.tracking.status()?;
+                let name = upstream
+                    .ref_name
+                    .strip_prefix("refs/remotes/")
+                    .unwrap_or(&upstream.ref_name)
+                    .to_string();
+                Some((name, tracking.ahead as usize, tracking.behind as usize))
+            });
 
             let branch_name = repo
                 .branch
@@ -977,7 +990,7 @@ impl TitleBar {
                 (IconName::GitBranch, Color::Muted)
             };
 
-            (branch_name, icon_info, is_detached_head)
+            (branch_name, icon_info, is_detached_head, upstream_state)
         };
 
         let settings = TitleBarSettings::get_global(cx);
@@ -1044,6 +1057,18 @@ impl TitleBar {
         let branch_picker = branch_name.and_then(|branch_name| {
             settings.show_branch_name.then(|| {
                 let branch_tooltip_label = branch_name.clone();
+                let upstream_state = upstream_state.clone();
+                let upstream_label: Option<SharedString> =
+                    upstream_state
+                        .as_ref()
+                        .and_then(|(_, ahead, behind)| match (*ahead, *behind) {
+                            (0, 0) => None,
+                            (ahead, 0) => Some(format!("\u{2191}{ahead}").into()),
+                            (0, behind) => Some(format!("\u{2193}{behind}").into()),
+                            (ahead, behind) => {
+                                Some(format!("\u{2191}{ahead} \u{2193}{behind}").into())
+                            }
+                        });
                 let (branch_icon, branch_icon_color) = if settings.show_branch_status_icon {
                     icon_info
                 } else {
@@ -1061,7 +1086,11 @@ impl TitleBar {
                                 .color(Color::Muted),
                         )
                 } else {
-                    Button::new("project_branch_trigger", branch_name)
+                    let label: SharedString = match &upstream_label {
+                        Some(upstream_label) => format!("{branch_name} {upstream_label}").into(),
+                        None => branch_name.into(),
+                    };
+                    Button::new("project_branch_trigger", label)
                         .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                         .label_size(LabelSize::Small)
                         .color(Color::Muted)
@@ -1086,7 +1115,21 @@ impl TitleBar {
                         let meta = if is_detached_head {
                             format!("Detached HEAD: {}", branch_tooltip_label)
                         } else {
-                            format!("Currently Checked Out: {}", branch_tooltip_label)
+                            match &upstream_state {
+                                Some((upstream, 0, 0)) => format!(
+                                    "Currently Checked Out: {branch_tooltip_label} \u{2022} up to date with {upstream}"
+                                ),
+                                Some((upstream, ahead, 0)) => format!(
+                                    "Currently Checked Out: {branch_tooltip_label} \u{2022} {ahead} to push to {upstream}"
+                                ),
+                                Some((upstream, 0, behind)) => format!(
+                                    "Currently Checked Out: {branch_tooltip_label} \u{2022} {behind} to pull from {upstream}"
+                                ),
+                                Some((upstream, ahead, behind)) => format!(
+                                    "Currently Checked Out: {branch_tooltip_label} \u{2022} {ahead} to push, {behind} to pull \u{2022} {upstream}"
+                                ),
+                                None => format!("Currently Checked Out: {branch_tooltip_label}"),
+                            }
                         };
                         Tooltip::with_meta(
                             "Branch & Stash",
