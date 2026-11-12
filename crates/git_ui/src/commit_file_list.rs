@@ -74,6 +74,16 @@ pub(crate) fn render_commit_file(
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> AnyElement {
+    render_commit_file_with_tooltip(id, file, true, on_click, cx)
+}
+
+pub(crate) fn render_commit_file_with_tooltip(
+    id: impl Into<ElementId>,
+    file: &CommitFileSummary,
+    show_tooltip: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
     let file_name: SharedString = file
         .path
         .file_name()
@@ -100,7 +110,9 @@ pub(crate) fn render_commit_file(
         .pl_6()
         .gap_1p5()
         .hover(|style| style.bg(cx.theme().colors().element_hover))
-        .tooltip(ui::Tooltip::text(full_path))
+        .when(show_tooltip, |this| {
+            this.tooltip(ui::Tooltip::text(full_path))
+        })
         .child(git_status_icon(file_status(file.status)))
         .child(Label::new(file_name).truncate())
         .when(!directory.is_empty(), |this| {
@@ -145,6 +157,7 @@ fn render_diff_stat(file: &CommitFileSummary) -> AnyElement {
 /// cannot grow rows inline (such as the graph table, whose row heights are
 /// pinned to the lane canvas).
 pub(crate) struct CommitFilesPopover {
+    title: SharedString,
     files: CommitFileList,
     focus_handle: gpui::FocusHandle,
     on_open_file: Rc<dyn Fn(RepoPath, &mut Window, &mut App)>,
@@ -155,6 +168,7 @@ impl CommitFilesPopover {
     pub(crate) fn new(
         repository: gpui::Entity<project::git_store::Repository>,
         sha: git::Oid,
+        title: SharedString,
         on_open_file: Rc<dyn Fn(RepoPath, &mut Window, &mut App)>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -179,6 +193,7 @@ impl CommitFilesPopover {
         });
 
         Self {
+            title,
             files: CommitFileList::Loading,
             focus_handle: cx.focus_handle(),
             on_open_file,
@@ -208,39 +223,76 @@ impl Render for CommitFilesPopover {
             CommitFileList::Loaded(_) => None,
         };
 
+        let summary: SharedString = match &self.files {
+            CommitFileList::Loaded(files) if !files.is_empty() => {
+                let (added, deleted) = files.iter().fold((0, 0), |(added, deleted), file| {
+                    (added + file.stat.added, deleted + file.stat.deleted)
+                });
+                format!(
+                    "{} file{} changed  +{added} \u{2212}{deleted}",
+                    files.len(),
+                    if files.len() == 1 { "" } else { "s" }
+                )
+                .into()
+            }
+            _ => SharedString::default(),
+        };
+
         ui::Popover::new().child(
             v_flex()
                 .id("commit-files-popover")
                 .track_focus(&self.focus_handle)
-                .min_w(ui::px(320.))
-                .max_w(ui::px(560.))
+                .w(ui::px(440.))
                 .max_h(ui::px(400.))
-                .overflow_y_scroll()
-                .py_1()
-                .when_some(message, |this, message| {
-                    this.child(
-                        div().px_2().py_1().child(
-                            Label::new(message)
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        ),
-                    )
-                })
-                .map(|this| {
-                    let CommitFileList::Loaded(files) = &self.files else {
-                        return this;
-                    };
-                    this.children(files.iter().enumerate().map(|(index, file)| {
-                        let path = file.path.clone();
-                        let on_open_file = self.on_open_file.clone();
-                        render_commit_file(
-                            ("commit-files-popover-file", index),
-                            file,
-                            move |_, window, cx| on_open_file(path.clone(), window, cx),
-                            cx,
-                        )
-                    }))
-                }),
+                .child(
+                    v_flex()
+                        .w_full()
+                        .px_2()
+                        .pb_1()
+                        .border_b_1()
+                        .border_color(cx.theme().colors().border_variant)
+                        .child(Label::new(self.title.clone()).truncate())
+                        .when(!summary.is_empty(), |this| {
+                            this.child(
+                                Label::new(summary)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        }),
+                )
+                .child(
+                    v_flex()
+                        .id("commit-files-popover-list")
+                        .w_full()
+                        .min_h_0()
+                        .py_1()
+                        .overflow_y_scroll()
+                        .when_some(message, |this, message| {
+                            this.child(
+                                div().px_2().py_1().child(
+                                    Label::new(message)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                            )
+                        })
+                        .map(|this| {
+                            let CommitFileList::Loaded(files) = &self.files else {
+                                return this;
+                            };
+                            this.children(files.iter().enumerate().map(|(index, file)| {
+                                let path = file.path.clone();
+                                let on_open_file = self.on_open_file.clone();
+                                render_commit_file_with_tooltip(
+                                    ("commit-files-popover-file", index),
+                                    file,
+                                    false,
+                                    move |_, window, cx| on_open_file(path.clone(), window, cx),
+                                    cx,
+                                )
+                            }))
+                        }),
+                ),
         )
     }
 }
