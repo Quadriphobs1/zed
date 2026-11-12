@@ -6,7 +6,7 @@
 use anyhow::Result;
 use git::repository::{CommitFileStatus, RepoPath};
 use git::status::DiffStat;
-use gpui::{App, AppContext as _, AsyncApp, SharedString, Task};
+use gpui::{App, AppContext as _, AsyncApp, Entity, SharedString, Task};
 use language::Rope;
 use language::{Buffer, LanguageRegistry};
 use project::git_store::CommitFile;
@@ -58,12 +58,23 @@ pub(crate) struct FileOverview {
     pub(crate) symbols: Vec<ChangedSymbol>,
 }
 
+/// One caller of a changed symbol, as reported by a language server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CallEdge {
+    pub(crate) caller: SharedString,
+    pub(crate) caller_path: Option<SharedString>,
+    pub(crate) callee: SharedString,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ChangeOverview {
     pub(crate) title: SharedString,
     pub(crate) files: Vec<FileOverview>,
     /// Newest first, as GitHub reports them.
     pub(crate) commits: Vec<(SharedString, SharedString)>,
+    /// Who calls the changed symbols. Only available for changes whose files
+    /// are checked out locally and whose language server answers.
+    pub(crate) call_edges: Vec<CallEdge>,
 }
 
 /// Extracts the structure of a change. Parsing happens off the main thread, so
@@ -124,6 +135,7 @@ pub(crate) fn build_change_overview(
                 title,
                 files: Vec::with_capacity(snapshots.len()),
                 commits,
+                call_edges: Vec::new(),
             };
             for (summary, (old_snapshot, new_snapshot)) in summaries.into_iter().zip(snapshots) {
                 let old_symbols = match old_snapshot {
@@ -153,6 +165,9 @@ fn outline_symbols(snapshot: &language::BufferSnapshot) -> Vec<(SharedString, St
         .outline(None)
         .items
         .into_iter()
+        // Nested items are locals and fields; a change summary is about the
+        // declarations that other code can reach.
+        .filter(|item| item.depth == 0)
         .map(|item| {
             let body = snapshot.text_for_range(item.range).collect::<String>();
             (item.text, body)
@@ -189,6 +204,111 @@ fn changed_symbols(
     changes
 }
 
+/// How much language server work a single overview may trigger.
+const MAX_CALL_GRAPH_FILES: usize = 10;
+const MAX_CALL_GRAPH_SYMBOLS: usize = 12;
+const MAX_CALLERS_PER_SYMBOL: usize = 6;
+
+/// Asks the language servers which code calls the symbols this change touches.
+/// Only the working copy can be queried, so this is for local revisions; files
+/// that are absent, unsupported or still indexing simply contribute no edges.
+pub(crate) fn collect_call_edges(
+    overview: &ChangeOverview,
+    project: Entity<project::Project>,
+    repository: Entity<project::git_store::Repository>,
+    cx: &mut App,
+) -> Task<Vec<CallEdge>> {
+    let targets = overview
+        .files
+        .iter()
+        .filter(|file| file.status != CommitFileStatus::Deleted && !file.symbols.is_empty())
+        .take(MAX_CALL_GRAPH_FILES)
+        .map(|file| {
+            let symbols = file
+                .symbols
+                .iter()
+                .filter(|symbol| symbol.change != SymbolChange::Removed)
+                .map(|symbol| symbol.name.clone())
+                .collect::<Vec<_>>();
+            (file.path.clone(), symbols)
+        })
+        .collect::<Vec<_>>();
+
+    cx.spawn(async move |cx: &mut AsyncApp| {
+        let mut edges: Vec<CallEdge> = Vec::new();
+        let mut budget = MAX_CALL_GRAPH_SYMBOLS;
+        for (path, symbols) in targets {
+            if budget == 0 {
+                break;
+            }
+            let Some(project_path) = repository.read_with(cx, |repository, cx| {
+                repository.repo_path_to_project_path(&path, cx)
+            }) else {
+                continue;
+            };
+            let buffer = cx.update(|cx| {
+                project.update(cx, |project, cx| project.open_buffer(project_path, cx))
+            });
+            let Ok(buffer) = buffer.await else {
+                continue;
+            };
+
+            let positions = buffer.read_with(cx, |buffer, _| {
+                let snapshot = buffer.snapshot();
+                snapshot
+                    .outline(None)
+                    .items
+                    .into_iter()
+                    .filter(|item| item.depth == 0 && symbols.contains(&item.text))
+                    .map(|item| (item.text, item.selection_range.start))
+                    .collect::<Vec<_>>()
+            });
+
+            for (name, position) in positions {
+                if budget == 0 {
+                    break;
+                }
+                budget -= 1;
+                let prepare = cx.update(|cx| {
+                    project.update(cx, |project, cx| {
+                        project.prepare_call_hierarchy(&buffer, position, cx)
+                    })
+                });
+                let Some(item) = prepare
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|items| items.into_iter().next())
+                else {
+                    continue;
+                };
+                let calls = cx.update(|cx| {
+                    project.update(cx, |project, cx| project.incoming_calls(item, cx))
+                });
+                let Some(calls) = calls.await.ok().flatten() else {
+                    continue;
+                };
+                for call in calls.into_iter().take(MAX_CALLERS_PER_SYMBOL) {
+                    let caller_path = call.from.buffer.read_with(cx, |buffer, _| {
+                        buffer
+                            .file()
+                            .map(|file| SharedString::from(file.path().as_unix_str().to_string()))
+                    });
+                    let edge = CallEdge {
+                        caller: call.from.name.into(),
+                        caller_path,
+                        callee: name.clone(),
+                    };
+                    if !edges.contains(&edge) {
+                        edges.push(edge);
+                    }
+                }
+            }
+        }
+        edges
+    })
+}
+
 impl ChangeOverview {
     fn totals(&self) -> (u32, u32) {
         self.files.iter().fold((0, 0), |(added, deleted), file| {
@@ -206,6 +326,7 @@ impl ChangeOverview {
             self.files.len()
         );
         markdown.push_str(&self.impact_diagram());
+        markdown.push_str(&self.call_graph_diagram());
         if !self.commits.is_empty() {
             markdown.push_str(&self.commit_diagram());
         }
@@ -217,12 +338,7 @@ impl ChangeOverview {
         let mut diagram = String::from("### Impact map\n\n```mermaid\nflowchart LR\n");
         let mut directories: Vec<&str> = Vec::new();
         for file in self.files.iter().take(MAX_DIAGRAM_FILES) {
-            let directory = file
-                .path
-                .parent()
-                .map(|parent| parent.as_unix_str())
-                .filter(|parent| !parent.is_empty())
-                .unwrap_or("(root)");
+            let directory = file_directory(file);
             if !directories.contains(&directory) {
                 directories.push(directory);
             }
@@ -235,60 +351,93 @@ impl ChangeOverview {
                 escape(directory)
             );
             for (file_index, file) in self.files.iter().take(MAX_DIAGRAM_FILES).enumerate() {
-                let file_directory = file
-                    .path
-                    .parent()
-                    .map(|parent| parent.as_unix_str())
-                    .filter(|parent| !parent.is_empty())
-                    .unwrap_or("(root)");
-                if file_directory != *directory {
+                if file_directory(file) != *directory {
                     continue;
                 }
                 let name = file
                     .path
                     .file_name()
                     .unwrap_or_else(|| file.path.as_unix_str());
-                let _ = writeln!(
-                    diagram,
-                    "    f{file_index}[\"{} {}<br/>+{} −{}\"]",
+                // Symbols live inside the file's node: a node per symbol turns
+                // even a small change into a diagram taller than the window.
+                let mut label = format!(
+                    "{} {}<br/>+{} \u{2212}{}",
                     status_marker(file.status),
                     escape(name),
                     file.stat.added,
                     file.stat.deleted
                 );
+                for symbol in file.symbols.iter().take(MAX_DIAGRAM_SYMBOLS_PER_FILE) {
+                    let _ = write!(
+                        label,
+                        "<br/>{} {}",
+                        symbol.change.marker(),
+                        escape(&truncate(&symbol.name, 48))
+                    );
+                }
+                let hidden = file
+                    .symbols
+                    .len()
+                    .saturating_sub(MAX_DIAGRAM_SYMBOLS_PER_FILE);
+                if hidden > 0 {
+                    let _ = write!(label, "<br/>\u{2026} {hidden} more");
+                }
+                let _ = writeln!(diagram, "    f{file_index}[\"{label}\"]");
             }
             diagram.push_str("  end\n");
         }
 
-        for (file_index, file) in self.files.iter().take(MAX_DIAGRAM_FILES).enumerate() {
-            for (symbol_index, symbol) in file
-                .symbols
-                .iter()
-                .take(MAX_DIAGRAM_SYMBOLS_PER_FILE)
-                .enumerate()
-            {
-                let _ = writeln!(
-                    diagram,
-                    "  f{file_index} --> f{file_index}s{symbol_index}[\"{} {}\"]",
-                    symbol.change.marker(),
-                    escape(&symbol.name)
-                );
+        let hidden_files = self.files.len().saturating_sub(MAX_DIAGRAM_FILES);
+        if hidden_files > 0 {
+            let _ = writeln!(diagram, "  more[\"\u{2026} {hidden_files} more file(s)\"]");
+        }
+        diagram.push_str("```\n\n");
+        diagram
+    }
+
+    /// Draws who calls the changed symbols, which is the part of a change that
+    /// a file list cannot show.
+    fn call_graph_diagram(&self) -> String {
+        if self.call_edges.is_empty() {
+            return String::new();
+        }
+        let mut diagram = String::from("### Callers of changed code\n\n```mermaid\nflowchart LR\n");
+        let mut callers: Vec<&CallEdge> = Vec::new();
+        for edge in &self.call_edges {
+            if !callers.iter().any(|existing| {
+                existing.caller == edge.caller && existing.caller_path == edge.caller_path
+            }) {
+                callers.push(edge);
             }
-            let hidden = file
-                .symbols
-                .len()
-                .saturating_sub(MAX_DIAGRAM_SYMBOLS_PER_FILE);
-            if hidden > 0 {
-                let _ = writeln!(
-                    diagram,
-                    "  f{file_index} --> f{file_index}more[\"… {hidden} more\"]"
-                );
+        }
+        let mut callees: Vec<&SharedString> = Vec::new();
+        for edge in &self.call_edges {
+            if !callees.contains(&&edge.callee) {
+                callees.push(&edge.callee);
             }
         }
 
-        let hidden_files = self.files.len().saturating_sub(MAX_DIAGRAM_FILES);
-        if hidden_files > 0 {
-            let _ = writeln!(diagram, "  more[\"… {hidden_files} more file(s)\"]");
+        for (index, callee) in callees.iter().enumerate() {
+            let _ = writeln!(diagram, "  t{index}[\"{}\"]", escape(callee));
+        }
+        for (caller_index, caller) in callers.iter().enumerate() {
+            let label = match &caller.caller_path {
+                Some(path) => format!("{} ({})", caller.caller, truncate(path, 40)),
+                None => caller.caller.to_string(),
+            };
+            let _ = writeln!(diagram, "  c{caller_index}[\"{}\"]", escape(&label));
+        }
+        for edge in &self.call_edges {
+            let Some(caller_index) = callers.iter().position(|existing| {
+                existing.caller == edge.caller && existing.caller_path == edge.caller_path
+            }) else {
+                continue;
+            };
+            let Some(callee_index) = callees.iter().position(|callee| **callee == edge.callee)
+            else {
+                continue;
+            };
+            let _ = writeln!(diagram, "  c{caller_index} --> t{callee_index}");
         }
         diagram.push_str("```\n\n");
         diagram
@@ -380,6 +529,20 @@ impl ChangeOverview {
         if hidden_files > 0 {
             let _ = writeln!(prompt, "- … {hidden_files} more file(s)");
         }
+        if !self.call_edges.is_empty() {
+            prompt.push_str("Existing callers of the changed symbols:\n");
+            for edge in &self.call_edges {
+                match &edge.caller_path {
+                    Some(path) => {
+                        let _ =
+                            writeln!(prompt, "- {} ({path}) calls {}", edge.caller, edge.callee);
+                    }
+                    None => {
+                        let _ = writeln!(prompt, "- {} calls {}", edge.caller, edge.callee);
+                    }
+                }
+            }
+        }
         prompt
     }
 }
@@ -405,6 +568,14 @@ what to check in each.
 
 Keep mermaid node labels short, quote every label, and never include code from \
 the change.";
+
+fn file_directory(file: &FileOverview) -> &str {
+    file.path
+        .parent()
+        .map(|parent| parent.as_unix_str())
+        .filter(|parent| !parent.is_empty())
+        .unwrap_or("(root)")
+}
 
 fn status_marker(status: CommitFileStatus) -> &'static str {
     match status {
@@ -527,6 +698,11 @@ mod tests {
                 },
             ],
             commits: vec![("abc1234".into(), "Add toggle".into())],
+            call_edges: vec![CallEdge {
+                caller: "fn caller".into(),
+                caller_path: Some("crates/git_ui/src/git_ui.rs".into()),
+                callee: "fn toggle".into(),
+            }],
         }
     }
 
@@ -547,6 +723,7 @@ mod tests {
         assert!(prompt.contains("Files changed: 2, +13 −2"));
         assert!(prompt.contains("- abc1234 Add toggle"));
         assert!(prompt.contains("    + fn toggle"));
+        assert!(prompt.contains("- fn caller (crates/git_ui/src/git_ui.rs) calls fn toggle"));
         assert!(!prompt.contains("```"), "the prompt must not contain code");
     }
 
