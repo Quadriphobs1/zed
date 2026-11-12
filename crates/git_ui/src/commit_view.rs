@@ -1,4 +1,6 @@
-use crate::change_overview::{ChangeOverview, build_change_overview, narrate_overview};
+use crate::change_overview::{
+    ChangeOverview, build_change_overview, collect_call_edges, narrate_overview,
+};
 use anyhow::{Context as _, Result};
 use buffer_diff::BufferDiff;
 use collections::HashMap;
@@ -1146,6 +1148,8 @@ impl CommitView {
         });
         let languages = self.project.read(cx).languages().clone();
         let file_filter = self.file_filter.clone();
+        let project = self.project.clone();
+        let repository = self.repository.clone();
 
         self.overview_error = None;
         self.overview_loading = true;
@@ -1160,6 +1164,17 @@ impl CommitView {
                         build_change_overview(title, diff.files, Vec::new(), Some(languages), cx)
                     })
                     .await
+                }
+                Err(error) => Err(error),
+            };
+            let overview = match overview {
+                Ok(mut overview) => {
+                    // The working copy is what the language servers know about,
+                    // so callers can only be resolved for local revisions.
+                    overview.call_edges = cx
+                        .update(|cx| collect_call_edges(&overview, project, repository, cx))
+                        .await;
+                    Ok(overview)
                 }
                 Err(error) => Err(error),
             };
