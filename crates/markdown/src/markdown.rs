@@ -497,6 +497,9 @@ impl Default for MermaidViewState {
 pub struct Markdown {
     source: SharedString,
     selection: Selection,
+    /// The code block link under the mouse, so that it can be underlined the
+    /// way a link in prose is.
+    hovered_code_link: Option<Range<usize>>,
     pressed_link: Option<RenderedLink>,
     pressed_footnote_ref: Option<RenderedFootnoteRef>,
     autoscroll_request: Option<usize>,
@@ -718,6 +721,7 @@ impl Markdown {
         let mut this = Self {
             source,
             selection: Selection::default(),
+            hovered_code_link: None,
             pressed_link: None,
             pressed_footnote_ref: None,
             autoscroll_request: None,
@@ -1997,7 +2001,7 @@ impl MarkdownElement {
             if link_range.end > text.len() || link_range.start >= link_range.end {
                 continue;
             }
-            builder.push_link(
+            builder.push_code_block_link(
                 url,
                 range.start + link_range.start..range.start + link_range.end,
             );
@@ -2585,7 +2589,14 @@ impl MarkdownElement {
                     if let Some(on_url_hover) = on_url_hover.as_ref() {
                         on_url_hover(hovered_url, window, cx);
                     }
-                    if is_hovering_clickable != was_hovering_clickable {
+                    let hovered_code_link = source_index
+                        .and_then(|source_index| {
+                            rendered_text.code_block_link_for_source_index(source_index)
+                        })
+                        .map(|link| link.source_range.clone());
+                    let code_link_changed = markdown.hovered_code_link != hovered_code_link;
+                    markdown.hovered_code_link = hovered_code_link;
+                    if code_link_changed || is_hovering_clickable != was_hovering_clickable {
                         cx.notify();
                     }
                 }
@@ -2771,6 +2782,7 @@ impl Element for MarkdownElement {
         };
         let mut code_block_ids = HashSet::default();
         let mut current_code_block_text = None;
+        let hovered_code_link = self.markdown.read(cx).hovered_code_link.clone();
 
         let mut current_img_block_range: Option<Range<usize>> = None;
         let mut handled_html_block = false;
@@ -3397,10 +3409,16 @@ impl Element for MarkdownElement {
                         current_code_block_text.push_str(text);
                     }
                     self.push_code_block_links(&mut builder, text, &range, cx);
+                    let underline = hovered_code_link.as_ref().and_then(|hovered| {
+                        let start = hovered.start.checked_sub(range.start)?;
+                        let end = hovered.end.checked_sub(range.start)?;
+                        (end <= text.len()).then_some(start..end)
+                    });
                     builder.push_highlighted_text(
                         text,
                         range.clone(),
                         parsed_markdown.code_block_highlights.get(&event_index),
+                        underline,
                     );
                 }
                 MarkdownEvent::SubstitutedText(text) => {
@@ -3411,6 +3429,7 @@ impl Element for MarkdownElement {
                         text,
                         range.clone(),
                         parsed_markdown.code_block_highlights.get(&event_index),
+                        None,
                     );
                 }
                 MarkdownEvent::Code => {
@@ -3891,6 +3910,7 @@ struct MarkdownElementBuilder {
     rendered_lines: Vec<Rc<RenderedLine>>,
     pending_line: PendingLine,
     rendered_links: Vec<RenderedLink>,
+    rendered_code_block_links: Vec<RenderedLink>,
     rendered_image_links: Vec<RenderedImageLink>,
     rendered_footnote_refs: Vec<RenderedFootnoteRef>,
     current_source_index: usize,
@@ -3982,6 +4002,31 @@ impl DivStackEntry {
     }
 }
 
+/// Splits a run's byte range into underlined and plain parts, reporting the
+/// length of each part in order. A run that the underline does not touch is
+/// reported unchanged, so callers never need a special case for it.
+fn split_run_for_underline(
+    range: Range<usize>,
+    underline: Option<&Range<usize>>,
+) -> SmallVec<[(usize, bool); 3]> {
+    let len = range.end.saturating_sub(range.start);
+    let Some(underline) =
+        underline.filter(|underline| underline.start < range.end && range.start < underline.end)
+    else {
+        return SmallVec::from_iter((len > 0).then_some((len, false)));
+    };
+    let underlined = underline.start.max(range.start)..underline.end.min(range.end);
+    [
+        (range.start..underlined.start, false),
+        (underlined.clone(), true),
+        (underlined.end..range.end, false),
+    ]
+    .into_iter()
+    .filter(|(part, _)| part.start < part.end)
+    .map(|(part, underlined)| (part.end - part.start, underlined))
+    .collect()
+}
+
 #[derive(Default)]
 struct PendingLine {
     text: String,
@@ -4013,6 +4058,7 @@ impl MarkdownElementBuilder {
             rendered_lines: Vec::new(),
             pending_line: PendingLine::default(),
             rendered_links: Vec::new(),
+            rendered_code_block_links: Vec::new(),
             rendered_image_links: Vec::new(),
             rendered_footnote_refs: Vec::new(),
             current_source_index: 0,
@@ -4252,6 +4298,14 @@ impl MarkdownElementBuilder {
         });
     }
 
+    fn push_code_block_link(&mut self, destination_url: SharedString, source_range: Range<usize>) {
+        self.rendered_code_block_links.push(RenderedLink {
+            source_range: source_range.clone(),
+            destination_url: destination_url.clone(),
+        });
+        self.push_link(destination_url, source_range);
+    }
+
     fn push_image_link(
         &mut self,
         destination_url: SharedString,
@@ -4271,7 +4325,30 @@ impl MarkdownElementBuilder {
     }
 
     fn push_text(&mut self, text: &str, source_range: Range<usize>) {
-        self.push_highlighted_text(text, source_range, None);
+        self.push_highlighted_text(text, source_range, None, None);
+    }
+
+    /// Splits `run` so that the parts inside `underline` are underlined, which
+    /// is how a hovered link inside a code block is marked as clickable.
+    fn push_run_underlining(
+        &mut self,
+        run: gpui::TextRun,
+        range: Range<usize>,
+        underline: Option<&Range<usize>>,
+    ) {
+        let underline_style = gpui::UnderlineStyle {
+            thickness: px(1.),
+            color: None,
+            wavy: false,
+        };
+        for (len, underlined) in split_run_for_underline(range, underline) {
+            let mut part = run.clone();
+            part.len = len;
+            if underlined {
+                part.underline = Some(underline_style);
+            }
+            self.pending_line.runs.push(part);
+        }
     }
 
     fn push_highlighted_text(
@@ -4279,6 +4356,7 @@ impl MarkdownElementBuilder {
         text: &str,
         source_range: Range<usize>,
         highlights: Option<&ResolvedHighlights>,
+        underline: Option<Range<usize>>,
     ) {
         self.pending_line.source_mappings.push(SourceMapping {
             rendered_index: self.pending_line.text.len(),
@@ -4301,30 +4379,36 @@ impl MarkdownElementBuilder {
             let mut offset = 0;
             for (run_range, highlight_id) in runs.iter() {
                 if run_range.start > offset {
-                    self.pending_line
-                        .runs
-                        .push(text_style.to_run(run_range.start - offset));
+                    self.push_run_underlining(
+                        text_style.to_run(run_range.start - offset),
+                        offset..run_range.start,
+                        underline.as_ref(),
+                    );
                 }
 
                 let run_len = run_range.len();
                 let highlight = self.syntax_theme.get(*highlight_id).cloned();
-                if let Some(highlight) = highlight {
-                    self.pending_line
-                        .runs
-                        .push(text_style.clone().highlight(highlight).to_run(run_len));
-                } else {
-                    self.pending_line.runs.push(text_style.to_run(run_len));
-                }
+                let run = match highlight {
+                    Some(highlight) => text_style.clone().highlight(highlight).to_run(run_len),
+                    None => text_style.to_run(run_len),
+                };
+                self.push_run_underlining(run, run_range.clone(), underline.as_ref());
                 offset = run_range.end;
             }
 
             if offset < text.len() {
-                self.pending_line
-                    .runs
-                    .push(text_style.to_run(text.len() - offset));
+                self.push_run_underlining(
+                    text_style.to_run(text.len() - offset),
+                    offset..text.len(),
+                    underline.as_ref(),
+                );
             }
         } else {
-            self.pending_line.runs.push(text_style.to_run(text.len()));
+            self.push_run_underlining(
+                text_style.to_run(text.len()),
+                0..text.len(),
+                underline.as_ref(),
+            );
         }
     }
 
@@ -4470,6 +4554,7 @@ impl MarkdownElementBuilder {
             text: RenderedText {
                 lines: self.rendered_lines.into(),
                 links: self.rendered_links.into(),
+                code_block_links: self.rendered_code_block_links.into(),
                 image_links: self.rendered_image_links.into(),
                 footnote_refs: self.rendered_footnote_refs.into(),
             },
@@ -4925,6 +5010,7 @@ pub struct RenderedMarkdown {
 struct RenderedText {
     lines: Rc<[Rc<RenderedLine>]>,
     links: Rc<[RenderedLink]>,
+    code_block_links: Rc<[RenderedLink]>,
     image_links: Rc<[RenderedImageLink]>,
     footnote_refs: Rc<[RenderedFootnoteRef]>,
 }
@@ -5208,6 +5294,14 @@ impl RenderedText {
         // Remove trailing newline
         accumulator.pop();
         accumulator
+    }
+
+    /// Code block links are reported separately from prose links so that only
+    /// they are underlined on hover; prose links are styled already.
+    fn code_block_link_for_source_index(&self, source_index: usize) -> Option<&RenderedLink> {
+        self.code_block_links
+            .iter()
+            .find(|link| link.source_range.contains(&source_index))
     }
 
     fn link_for_source_index(&self, source_index: usize) -> Option<&RenderedLink> {
@@ -7449,6 +7543,33 @@ mod tests {
         let diagnostic = "    | { a: string }";
         assert!(has_code_block(diagnostic));
         assert!(!has_code_block(&Markdown::escape(diagnostic)));
+    }
+
+    #[test]
+    fn test_split_run_for_underline() {
+        assert_eq!(
+            split_run_for_underline(0..10, None).into_vec(),
+            vec![(10, false)]
+        );
+        assert_eq!(
+            split_run_for_underline(0..10, Some(&(20..30))).into_vec(),
+            vec![(10, false)],
+            "an underline elsewhere leaves the run whole"
+        );
+        assert_eq!(
+            split_run_for_underline(0..10, Some(&(2..5))).into_vec(),
+            vec![(2, false), (3, true), (5, false)]
+        );
+        assert_eq!(
+            split_run_for_underline(5..10, Some(&(0..20))).into_vec(),
+            vec![(5, true)],
+            "a run fully inside the underline is underlined whole"
+        );
+        assert_eq!(
+            split_run_for_underline(5..10, Some(&(7..20))).into_vec(),
+            vec![(2, false), (3, true)],
+            "an underline reaching past the run ends at the run"
+        );
     }
 
     #[gpui::test]
