@@ -66,6 +66,10 @@ const MERMAID_ZOOM_DEBOUNCE: Duration = Duration::from_millis(300);
 /// If the callback returns `None`, the default link style will be used.
 type LinkStyleCallback = Rc<dyn Fn(&str, &App) -> Option<TextStyleRefinement>>;
 pub type CodeSpanLinkCallback = Arc<dyn Fn(&str, &App) -> Option<SharedString> + 'static>;
+/// Reports the clickable regions of a fenced code block's text, as ranges into
+/// that text paired with the URL each one links to.
+pub type CodeBlockLinkCallback =
+    Arc<dyn Fn(&str, &App) -> Vec<(Range<usize>, SharedString)> + 'static>;
 type UrlHoverCallback = Rc<dyn Fn(Option<SharedString>, &mut Window, &mut App)>;
 type SourceClickCallback = Box<dyn Fn(usize, usize, &mut Window, &mut App) -> bool>;
 type CheckboxToggleCallback = Rc<dyn Fn(Range<usize>, bool, &mut Window, &mut App)>;
@@ -1815,6 +1819,7 @@ pub struct MarkdownElement {
     on_url_click: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App)>>,
     on_url_hover: Option<UrlHoverCallback>,
     code_span_link: Option<CodeSpanLinkCallback>,
+    code_block_link: Option<CodeBlockLinkCallback>,
     on_source_click: Option<SourceClickCallback>,
     on_checkbox_toggle: Option<CheckboxToggleCallback>,
     on_mermaid_zoom: Option<MermaidZoomCallback>,
@@ -1842,6 +1847,7 @@ impl MarkdownElement {
             on_url_click: None,
             on_url_hover: None,
             code_span_link: None,
+            code_block_link: None,
             on_source_click: None,
             on_checkbox_toggle: None,
             on_mermaid_zoom: None,
@@ -1908,6 +1914,16 @@ impl MarkdownElement {
         self
     }
 
+    /// Links regions of fenced code blocks, so that identifiers rendered inside
+    /// them can be navigated like ordinary links.
+    pub fn on_code_block_link(
+        mut self,
+        callback: impl Fn(&str, &App) -> Vec<(Range<usize>, SharedString)> + 'static,
+    ) -> Self {
+        self.code_block_link = Some(Arc::new(callback));
+        self
+    }
+
     pub fn on_code_span_link(
         mut self,
         callback: impl Fn(&str, &App) -> Option<SharedString> + 'static,
@@ -1956,6 +1972,36 @@ impl MarkdownElement {
     pub fn scroll_handle(mut self, scroll_handle: ScrollHandle) -> Self {
         self.autoscroll = AutoscrollBehavior::Controlled(scroll_handle);
         self
+    }
+
+    /// Code block text is rendered verbatim from the source, so the callback's
+    /// ranges can be offset into the source directly. Substituted text has no
+    /// such mapping and is therefore left alone.
+    fn push_code_block_links(
+        &self,
+        builder: &mut MarkdownElementBuilder,
+        text: &str,
+        range: &Range<usize>,
+        cx: &App,
+    ) {
+        if builder.code_block_stack.is_empty()
+            || builder.link_depth > 0
+            || self.style.prevent_mouse_interaction
+        {
+            return;
+        }
+        let Some(callback) = self.code_block_link.as_ref() else {
+            return;
+        };
+        for (link_range, url) in callback(text, cx) {
+            if link_range.end > text.len() || link_range.start >= link_range.end {
+                continue;
+            }
+            builder.push_link(
+                url,
+                range.start + link_range.start..range.start + link_range.end,
+            );
+        }
     }
 
     fn push_markdown_code_span(
@@ -3350,6 +3396,7 @@ impl Element for MarkdownElement {
                     if let Some(current_code_block_text) = &mut current_code_block_text {
                         current_code_block_text.push_str(text);
                     }
+                    self.push_code_block_links(&mut builder, text, &range, cx);
                     builder.push_highlighted_text(
                         text,
                         range.clone(),
@@ -5547,6 +5594,7 @@ mod tests {
                         ..MarkdownStyle::default()
                     },
                     code_span_link: None,
+                    code_block_link: None,
                     rendered_text,
                 }))
             }
@@ -7404,6 +7452,48 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_code_block_links_are_clickable(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        let source = "```ts\ntype StoredValue = CellResult\n```";
+        let markdown = cx.new(|cx| Markdown::new(source.to_string().into(), None, None, cx));
+        cx.run_until_parked();
+        let rendered = render_markdown_entity_in_view_with_links(
+            markdown,
+            MarkdownStyle::default(),
+            None,
+            Some(Arc::new(|text: &str, _: &App| {
+                text.match_indices("CellResult")
+                    .map(|(offset, name)| {
+                        (
+                            offset..offset + name.len(),
+                            SharedString::from("symbol:CellResult"),
+                        )
+                    })
+                    .collect()
+            })),
+            None,
+            cx,
+        );
+
+        assert_eq!(rendered.links.len(), 1);
+        assert_eq!(rendered.links[0].destination_url, "symbol:CellResult");
+        let inside = rendered.links[0].source_range.start;
+        assert_eq!(
+            rendered
+                .link_for_source_index(inside)
+                .map(|link| link.destination_url.clone()),
+            Some("symbol:CellResult".into()),
+            "clicking the identifier inside the code block must resolve to its link"
+        );
+        assert!(
+            rendered
+                .link_for_source_index(source.find("StoredValue").unwrap())
+                .is_none(),
+            "identifiers the callback did not report must stay inert"
+        );
+    }
+
+    #[gpui::test]
     fn test_link_detected_for_source_index(cx: &mut TestAppContext) {
         let rendered = render_markdown("[Click here](https://example.com)", cx);
 
@@ -8018,6 +8108,7 @@ mod tests {
                     ..MarkdownStyle::default()
                 },
                 code_span_link: None,
+                code_block_link: None,
                 rendered_text,
             }
         });
@@ -8092,6 +8183,7 @@ mod tests {
                 ..MarkdownStyle::default()
             },
             code_span_link: None,
+            code_block_link: None,
             rendered_text: Rc::new(RefCell::new(None)),
         });
         let window_width = px(300.);
@@ -8183,6 +8275,7 @@ mod tests {
                         ..MarkdownStyle::default()
                     },
                     code_span_link: None,
+                    code_block_link: None,
                     rendered_text: Rc::new(RefCell::new(None)),
                 });
                 cx.run_until_parked();
@@ -8257,6 +8350,7 @@ mod tests {
                 ..MarkdownStyle::default()
             },
             code_span_link: None,
+            code_block_link: None,
             rendered_text: Rc::new(RefCell::new(None)),
         });
         cx.run_until_parked();
@@ -8324,6 +8418,7 @@ mod tests {
                 ..MarkdownStyle::default()
             },
             code_span_link: None,
+            code_block_link: None,
             rendered_text: Rc::new(RefCell::new(None)),
         });
         cx.run_until_parked();
@@ -8668,6 +8763,7 @@ mod tests {
         markdown: Entity<Markdown>,
         style: MarkdownStyle,
         code_span_link: Option<CodeSpanLinkCallback>,
+        code_block_link: Option<CodeBlockLinkCallback>,
         rendered_text: Rc<RefCell<Option<RenderedText>>>,
     }
 
@@ -8678,6 +8774,10 @@ mod tests {
             if let Some(code_span_link) = self.code_span_link.clone() {
                 markdown_element =
                     markdown_element.on_code_span_link(move |text, cx| code_span_link(text, cx));
+            }
+            if let Some(code_block_link) = self.code_block_link.clone() {
+                markdown_element =
+                    markdown_element.on_code_block_link(move |text, cx| code_block_link(text, cx));
             }
             CapturingMarkdownElement {
                 markdown_element: markdown_element.code_block_renderer(
@@ -8774,6 +8874,17 @@ mod tests {
         width: Option<Pixels>,
         cx: &mut TestAppContext,
     ) -> RenderedText {
+        render_markdown_entity_in_view_with_links(markdown, style, code_span_link, None, width, cx)
+    }
+
+    fn render_markdown_entity_in_view_with_links(
+        markdown: Entity<Markdown>,
+        style: MarkdownStyle,
+        code_span_link: Option<CodeSpanLinkCallback>,
+        code_block_link: Option<CodeBlockLinkCallback>,
+        width: Option<Pixels>,
+        cx: &mut TestAppContext,
+    ) -> RenderedText {
         let rendered_text = Rc::new(RefCell::new(None));
         let (_, cx) = cx.add_window_view({
             let rendered_text = rendered_text.clone();
@@ -8781,6 +8892,7 @@ mod tests {
                 markdown,
                 style,
                 code_span_link,
+                code_block_link,
                 rendered_text,
             }
         });

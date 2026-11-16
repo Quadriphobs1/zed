@@ -1154,6 +1154,223 @@ fn parse_file_link(link: &str) -> Option<(PathBuf, Option<String>)> {
     Some((path, fragment))
 }
 
+/// Links in hover popovers that point at a symbol rather than a URL.
+const HOVER_SYMBOL_SCHEME: &str = "zed-hover-symbol:";
+
+/// Words that appear in rendered type signatures but never name a symbol worth
+/// navigating to. Keeping this list small is deliberate: an identifier that
+/// resolves to nothing simply does nothing when clicked.
+const HOVER_SYMBOL_STOP_WORDS: &[&str] = &[
+    "abstract",
+    "any",
+    "as",
+    "async",
+    "await",
+    "bool",
+    "boolean",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "constructor",
+    "continue",
+    "declare",
+    "default",
+    "delete",
+    "do",
+    "dyn",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "extern",
+    "false",
+    "final",
+    "fn",
+    "for",
+    "from",
+    "function",
+    "get",
+    "if",
+    "impl",
+    "implements",
+    "import",
+    "in",
+    "infer",
+    "instanceof",
+    "interface",
+    "is",
+    "keyof",
+    "let",
+    "match",
+    "mod",
+    "module",
+    "mut",
+    "namespace",
+    "never",
+    "new",
+    "null",
+    "number",
+    "object",
+    "of",
+    "private",
+    "protected",
+    "pub",
+    "public",
+    "readonly",
+    "ref",
+    "return",
+    "satisfies",
+    "self",
+    "set",
+    "static",
+    "string",
+    "struct",
+    "super",
+    "switch",
+    "symbol",
+    "this",
+    "throw",
+    "trait",
+    "true",
+    "try",
+    "type",
+    "typeof",
+    "undefined",
+    "union",
+    "unknown",
+    "unsafe",
+    "use",
+    "var",
+    "void",
+    "where",
+    "while",
+    "with",
+    "yield",
+];
+
+/// Finds the identifiers of a rendered signature, so that the types in a hover
+/// popover can be navigated to.
+pub(crate) fn hover_symbol_links(text: &str) -> Vec<(Range<usize>, SharedString)> {
+    let mut links = Vec::new();
+    let mut start = None;
+    for (offset, character) in text
+        .char_indices()
+        .chain(std::iter::once((text.len(), ' ')))
+    {
+        let is_identifier = character.is_alphanumeric() || character == '_' || character == '$';
+        match (start, is_identifier) {
+            (None, true) => start = Some(offset),
+            (Some(identifier_start), false) => {
+                start = None;
+                let identifier = &text[identifier_start..offset];
+                if identifier.len() < 2
+                    || identifier.starts_with(|character: char| character.is_numeric())
+                    || HOVER_SYMBOL_STOP_WORDS.contains(&identifier)
+                {
+                    continue;
+                }
+                links.push((
+                    identifier_start..offset,
+                    SharedString::from(format!("{HOVER_SYMBOL_SCHEME}{identifier}")),
+                ));
+            }
+            _ => {}
+        }
+    }
+    links
+}
+
+/// Navigates to the symbol a hover link names. A workspace symbol search
+/// answers for types declared in the project; when it finds nothing, which is
+/// the case for types a language ships with, the language server is asked for
+/// the hovered expression's type instead.
+fn open_hover_symbol(
+    editor: Entity<Editor>,
+    anchor: Option<Anchor>,
+    identifier: SharedString,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some((workspace, project)) = editor.read_with(cx, |editor, cx| {
+        let workspace = editor.workspace()?;
+        let project = workspace.read(cx).project().clone();
+        Some((workspace, project))
+    }) else {
+        return;
+    };
+
+    window
+        .spawn(cx, async move |cx| {
+            let symbols = project
+                .update(cx, |project, cx| project.symbols(identifier.as_ref(), cx))
+                .await
+                .unwrap_or_default();
+            let symbol = symbols
+                .into_iter()
+                .find(|symbol| symbol.name == identifier.as_ref());
+
+            let Some(symbol) = symbol else {
+                let Some(anchor) = anchor else {
+                    return anyhow::Ok(());
+                };
+                // The type of the hovered expression is the only target the
+                // language server can name here, so this is correct for the
+                // declared type and silently does nothing for other
+                // identifiers in the signature.
+                editor
+                    .update_in(cx, |editor: &mut Editor, window, cx| {
+                        editor.change_selections(
+                            crate::SelectionEffects::no_scroll(),
+                            window,
+                            cx,
+                            |selections| selections.select_anchor_ranges([anchor..anchor]),
+                        );
+                        editor.go_to_type_definition(
+                            &crate::actions::GoToTypeDefinition::default(),
+                            window,
+                            cx,
+                        )
+                    })?
+                    .await?;
+                return Ok(());
+            };
+
+            let buffer = project
+                .update(cx, |project, cx| {
+                    project.open_buffer_for_symbol(&symbol, cx)
+                })
+                .await?;
+            workspace.update_in(cx, |workspace, window, cx| {
+                let position = buffer
+                    .read(cx)
+                    .clip_point_utf16(symbol.range.start, text::Bias::Left);
+                let item = workspace
+                    .open_project_item::<Editor>(None, buffer, true, true, true, true, window, cx);
+                item.update(cx, |editor, cx| {
+                    let snapshot = editor.buffer().read(cx).snapshot(cx);
+                    let Some(buffer_snapshot) = snapshot.as_singleton() else {
+                        return;
+                    };
+                    let Some(anchor) =
+                        snapshot.anchor_in_buffer(buffer_snapshot.anchor_before(position))
+                    else {
+                        return;
+                    };
+                    editor.change_selections(
+                        crate::SelectionEffects::scroll(crate::Autoscroll::center()).unfold(),
+                        window,
+                        cx,
+                        |selections| selections.select_ranges([anchor..anchor]),
+                    );
+                });
+            })?;
+            Ok(())
+        })
+        .detach_and_log_err(cx);
+}
+
 pub fn open_markdown_url(
     workspace: Option<Entity<Workspace>>,
     link: SharedString,
@@ -1656,18 +1873,38 @@ impl InfoPopover {
                                                         border: false,
                                                     },
                                                 )
-                                                .on_url_click(move |link, window, cx| {
-                                                    open_markdown_url(
-                                                        this2
-                                                            .read_with(cx, |editor, _| {
-                                                                editor.workspace()
-                                                            })
-                                                            .ok()
-                                                            .flatten(),
-                                                        link,
-                                                        window,
-                                                        cx,
-                                                    )
+                                                .on_code_block_link(|text, _| {
+                                                    hover_symbol_links(text)
+                                                })
+                                                .on_url_click({
+                                                    let anchor = self.anchor;
+                                                    move |link, window, cx| {
+                                                        if let Some(identifier) =
+                                                            link.strip_prefix(HOVER_SYMBOL_SCHEME)
+                                                        {
+                                                            if let Some(editor) = this2.upgrade() {
+                                                                open_hover_symbol(
+                                                                    editor,
+                                                                    anchor,
+                                                                    identifier.to_string().into(),
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            }
+                                                            return;
+                                                        }
+                                                        open_markdown_url(
+                                                            this2
+                                                                .read_with(cx, |editor, _| {
+                                                                    editor.workspace()
+                                                                })
+                                                                .ok()
+                                                                .flatten(),
+                                                            link,
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    }
                                                 }),
                                             ),
                                         )
@@ -1861,6 +2098,51 @@ mod tests {
     use indoc::indoc;
     use language::{Buffer, BufferRow, FakeLspAdapter, LanguageServerId, rust_lang};
     use markdown::parser::MarkdownEvent;
+
+    #[test]
+    fn test_hover_symbol_links() {
+        let signature = "type StoredValue = CellResult | typeof IN_PROGRESS";
+        let links = hover_symbol_links(signature);
+        let named = links
+            .iter()
+            .map(|(range, url)| {
+                (
+                    &signature[range.clone()],
+                    url.strip_prefix(HOVER_SYMBOL_SCHEME).unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            named,
+            vec![
+                ("StoredValue", "StoredValue".to_string()),
+                ("CellResult", "CellResult".to_string()),
+                ("IN_PROGRESS", "IN_PROGRESS".to_string()),
+            ],
+            "keywords must not be linked, every other identifier must be"
+        );
+
+        assert!(
+            hover_symbol_links("const match: RegExpExecArray")
+                .iter()
+                .any(|(range, _)| &"const match: RegExpExecArray"[range.clone()]
+                    == "RegExpExecArray")
+        );
+        assert!(
+            hover_symbol_links("fn render(&self) -> impl IntoElement")
+                .iter()
+                .all(|(range, _)| {
+                    let text = &"fn render(&self) -> impl IntoElement"[range.clone()];
+                    text == "render" || text == "IntoElement"
+                }),
+            "language keywords of other languages must be filtered too"
+        );
+        assert!(
+            hover_symbol_links("a: 12 + b").is_empty(),
+            "single letters and numbers name nothing worth navigating to"
+        );
+    }
     use multi_buffer::MultiBuffer;
     use parking_lot::Mutex;
     use project::{
