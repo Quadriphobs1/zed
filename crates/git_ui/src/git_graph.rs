@@ -5518,6 +5518,7 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
             language_model::init(cx);
             crate::init(cx);
         });
